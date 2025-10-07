@@ -1,2 +1,9 @@
 streamlit
 geopy
+requests
+pandas
+numpy
+searoute
+scipy
+concurrent.futures
+csv
