@@ -1,9 +1,9 @@
 streamlit
 geopy
+searoute
 requests
 pandas
 numpy
-searoute
 scipy
 concurrent.futures
 csv
