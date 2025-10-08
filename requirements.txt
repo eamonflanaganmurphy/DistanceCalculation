@@ -5,5 +5,4 @@ requests
 pandas
 numpy
 scipy
-concurrent.futures
 csv
