@@ -278,11 +278,16 @@ if check_password():
                 'Destination Airport': destination_airport_name
             }
     
+        # Adding progress bar
+        progress_bar = st.progress(0)
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_group = {executor.submit(process_group, group): group for group in unique_groups}
-            for future in concurrent.futures.as_completed(future_to_group):
+            total_groups = len(unique_groups)
+            for i, future in enumerate(concurrent.futures.as_completed(future_to_group)):
                 group, result = future.result()
                 results_cache[group] = result
+                # Update progress bar
+                progress_bar.progress((i + 1) / total_groups)
     
         for index, row in rows_to_process.iterrows():
             group_key = row['group_key']
