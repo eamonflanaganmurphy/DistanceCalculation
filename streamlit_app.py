@@ -13,7 +13,7 @@ import csv
 # Google Maps API configurations
 DISTANCE_MATRIX_API_ENDPOINT = "https://maps.googleapis.com/maps/api/distancematrix/json"
 GEOCODING_API_ENDPOINT = "https://maps.googleapis.com/maps/api/geocode/json"
-API_KEY = st.secrets.google.api_key
+API_KEY = st.secrets.google_api_key
 
 # Caches
 distance_cache = {}      # {(origin_norm, destination_norm): (distance, source)}
