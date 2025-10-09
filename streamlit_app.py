@@ -27,6 +27,29 @@ _COORD_PATTERN_PLAIN = re.compile(
     r'^\s*([+-]?\d+(?:\.\d+)?)\s*[,;]\s*([+-]?\d+(?:\.\d+)?)\s*$'
 )
 
+
+def check_password():
+    """Returns True if the user entered the correct password."""
+    def password_entered():
+        if st.session_state["password"] == st.secrets["password"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # remove password from memory
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        # Ask for password
+        st.text_input("Password", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.text_input("Password", type="password", on_change=password_entered, key="password")
+        st.error("Incorrect password")
+        return False
+    else:
+        return True
+
+if check_password():
+
 def try_parse_coordinates(s):
     if not isinstance(s, str):
         return None
