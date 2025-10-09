@@ -156,7 +156,7 @@ if check_password():
                     distance = float(distance_text.replace(' km', '').replace(',', ''))
                 elif ' m' in distance_text:
                     distance = float(distance_text.replace(' m', '').replace(',', '')) / 1000.0
-                source = "Road Distance"
+                source = "Google Maps API, Shortest Road Distance"
         except (IndexError, KeyError, TypeError):
             pass
     
