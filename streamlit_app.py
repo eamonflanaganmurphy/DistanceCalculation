@@ -272,8 +272,11 @@ def process_file(input_file, output_file):
 
 # Web app
 def main():
-    st.title("Distance Calculation and File Processing App")
-
+    st.title("Distance Calculation")
+    st.write("Upload an excel file here with the headers "From", "To", "Mode". 
+    Mode can be either:
+        - "Truck, Van,Road" to calculate the shortest road distance between two points. ")
+    
     uploaded_file = st.file_uploader("Upload an Excel file", type=["xlsx"])
     if uploaded_file:
         input_file = BytesIO(uploaded_file.read())
