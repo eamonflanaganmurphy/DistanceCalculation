@@ -555,12 +555,12 @@ def process_file(
 
 def main():
     st.title("Distance Calculation")
-    st.write("Upload an Excel file with headers **From**, **To**, and **Mode**.")
+    st.caption("Automatically calculates road, air, and sea transport distances between locations for GHG emissions inventory calculations.")
 
     if not check_password():
         return
         
-    with st.expander("📘 How to use this tool", expanded=True):
+    with st.expander("📘 How to use this tool", expanded=False):
         st.markdown("""
         **1️⃣ Upload your file**
     
