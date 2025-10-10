@@ -596,7 +596,7 @@ def main():
     
     # Toggle for hub legs
     enable_hub_legs = st.checkbox(
-        "Enable nearest airport/port legs (adds hub columns; NOT counted in Distance (km))", value=False
+        "Enable nearest airport/port legs (adds road distances to closest airport/seaport in seperate columns)", value=False
     )
 
     uploaded_file = st.file_uploader("Upload an Excel file", type=["xlsx"])
