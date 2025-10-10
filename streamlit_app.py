@@ -590,8 +590,9 @@ def main():
         **🗺️ Notes**
         - Road distances use **Google Maps API** (shortest route).
         - Air distances use **Great Circle** calculations between airports.
-        - Sea distances use **Searoute shortest sea paths** between ports defined in your local `ports.geojson` file.
+        - Sea distances use **Searoute shortest sea paths** between ports.
         - All distances are in **kilometres (km)**.
+        - You may still want to modify these distances - e.g., trucking may not always take the shortest route so you may want to increase distances by 10% to compensate for this.
     """)
         
     with st.expander("🧭 Valid 'Mode' entries", expanded=False):
