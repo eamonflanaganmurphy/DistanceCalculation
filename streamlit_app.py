@@ -169,23 +169,16 @@ def nearest_point(tree, coords_array, names, target: Tuple[float, float]) -> Opt
     return (name, (float(lat), float(lng)))
 
 
-# ---------- Ports from GeoJSON (with codes in display name) ----------
+# ---------- Ports from local GeoJSON (with codes in display name) ----------
 @st.cache_data(show_spinner=False)
-def load_ports_from_geojson(source: str) -> List[Tuple[str, Tuple[float, float]]]:
+def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str, Tuple[float, float]]]:
     """
-    Load ports from a GeoJSON file (URL or local path).
+    Load ports from a local GeoJSON file at 'ports.geojson'.
     Returns list of (display_name_with_code, (lat, lng)) like 'Prague (CZPRA)'.
     """
-    text = None
-    if source.startswith("http://") or source.startswith("https://"):
-        r = requests.get(source, timeout=30)
-        r.raise_for_status()
-        text = r.text
-    else:
-        with open(source, "r", encoding="utf-8") as f:
-            text = f.read()
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    data = json.loads(text)
     features = data.get("features", [])
     ports: List[Tuple[str, Tuple[float, float]]] = []
     for feat in features:
@@ -362,11 +355,6 @@ def coerce_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
 def process_file(
     input_file,
     enable_hub_legs: bool,
-    use_geojson_ports: bool,
-    ports_geojson_source: Optional[str],
-    use_searoute_preferred_ports: bool,
-    origin_port_override: Optional[str],
-    destination_port_override: Optional[str],
 ) -> pd.DataFrame:
 
     df = pd.read_excel(input_file)
@@ -411,17 +399,17 @@ def process_file(
     airports = load_international_airports("airports.csv")
     airport_tree, airport_names, airport_coords = build_kdtree(airports)
 
-    # Ports KD-tree from GeoJSON (optional)
+    # Ports KD-tree from local GeoJSON
     ports_tree = None
     port_names: List[str] = []
     port_coords_arr = None
-    if enable_hub_legs and use_geojson_ports and ports_geojson_source:
-        try:
-            ports_list = load_ports_from_geojson(ports_geojson_source)
-            ports_tree, port_names, port_coords_arr = build_kdtree(ports_list)
-        except Exception as e:
-            st.warning(f"Could not load ports from GeoJSON source ({e}). Falling back to searoute’s internal ports.")
-            ports_tree, port_names, port_coords_arr = None, [], None
+    used_local_ports = False
+    try:
+        ports_list = load_ports_from_geojson_local("ports.geojson")
+        ports_tree, port_names, port_coords_arr = build_kdtree(ports_list)
+        used_local_ports = True
+    except Exception as e:
+        st.warning(f"Could not load local 'ports.geojson' ({e}). Falling back to searoute’s internal ports.")
 
     # Grouping
     tmp = rows_to_process.copy()
@@ -481,7 +469,7 @@ def process_file(
             elif mode_lower in ["cargo ship (sea)", "sea", "ocean", "vessel (sea)"]:
                 if origin_coords and destination_coords:
                     if enable_hub_legs and ports_tree is not None:
-                        # Use GeoJSON ports to pick nearest ports; then route sea between them
+                        # Use local ports.geojson to pick nearest ports; then route sea between them
                         o_port = nearest_point(ports_tree, port_coords_arr, port_names, origin_coords)
                         d_port = nearest_point(ports_tree, port_coords_arr, port_names, destination_coords)
                         if o_port and d_port:
@@ -510,16 +498,15 @@ def process_file(
                             origin_hub_label = f"{o_id}" if o_id else pd.NA
                             destination_hub_label = f"{d_id}" if d_id else pd.NA
                             main_distance = sea_dist
-                            # keep generic wording for internal fallback
                             source = "Sea (searoute)"
                     else:
-                        # No GeoJSON port KD-tree → use searoute internal ports or just searoute
+                        # No local ports KD-tree → use searoute internal ports or just searoute
                         sea_km, o_id, d_id, o_pll, d_pll = searoute_with_ports(
                             origin_coords,
                             destination_coords,
-                            prefer_auto_ports=enable_hub_legs and use_searoute_preferred_ports,
-                            origin_port_override=origin_port_override,
-                            destination_port_override=destination_port_override
+                            prefer_auto_ports=enable_hub_legs,
+                            origin_port_override=None,
+                            destination_port_override=None
                         )
                         sea_dist = sea_km
                         if enable_hub_legs and o_pll and d_pll:
@@ -541,8 +528,7 @@ def process_file(
                     dist = geodesic(origin_coords, destination_coords).kilometers
                     src = "Geodesic Distance"
                 main_distance = dist
-                # replace label if API worked
-                source = src if src != "Google Maps API Shortest Road Distance" else "Google Maps API Shortest Road Distance"
+                source = "Google Maps API Shortest Road Distance" if src == "Google Maps API Shortest Road Distance" else src
 
             else:
                 # default: treat like road
@@ -609,45 +595,10 @@ def main():
     if not check_password():
         return
 
-    # Options
+    # Toggle for hub legs
     enable_hub_legs = st.checkbox(
         "Enable nearest airport/port legs (adds hub columns; NOT counted in Distance (km))", value=False
     )
-
-    use_geojson_ports = False
-    ports_geojson_source = None
-    use_searoute_preferred_ports = False
-    origin_port_override = None
-    destination_port_override = None
-
-    if enable_hub_legs:
-        st.caption("Hub columns show road legs to/from the selected hub and the hub names with codes (e.g., 'Prague (CZPRA)').")
-
-        # Option 1: Use ports.geojson
-        use_geojson_ports = st.checkbox(
-            "Use ports.geojson to pick nearest seaports",
-            value=True,
-            help="Loads ports from a GeoJSON (URL or local path) and chooses the nearest ports to origin/destination."
-        )
-        if use_geojson_ports:
-            ports_geojson_source = st.text_input(
-                "ports.geojson URL or local path",
-                value="https://raw.githubusercontent.com/genthalili/searoute-py/main/searoute/data/ports.geojson"
-            ).strip()
-
-        # Option 2: fall back to searoute internal ports
-        if not use_geojson_ports:
-            if not _HAS_AREAFEATURE:
-                st.info("Your installed searoute version does not expose AreaFeature/PortProps; using direct coordinates only.")
-            else:
-                use_searoute_preferred_ports = st.checkbox(
-                    "Use searoute preferred ports (auto select)",
-                    value=True,
-                    help="Let searoute pick suitable ports from its internal database."
-                )
-                with st.expander("Optional: override port IDs (e.g., USNYC)"):
-                    origin_port_override = st.text_input("Origin port ID (optional)", value="").strip() or None
-                    destination_port_override = st.text_input("Destination port ID (optional)", value="").strip() or None
 
     uploaded_file = st.file_uploader("Upload an Excel file", type=["xlsx"])
     if uploaded_file:
@@ -661,13 +612,11 @@ def main():
         st.write("Processing file…")
         processed_df = process_file(
             input_file,
-            enable_hub_legs=enable_hub_legs,
-            use_geojson_ports=use_geojson_ports,
-            ports_geojson_source=ports_geojson_source,
-            use_searoute_preferred_ports=use_searoute_preferred_ports,
-            origin_port_override=origin_port_override,
-            destination_port_override=destination_port_override
+            enable_hub_legs=enable_hub_legs
         )
+
+        if enable_hub_legs:
+            st.caption("Ports are selected from local 'ports.geojson'. If not found, we fall back to searoute’s internal ports.")
 
         st.write("Processed data preview:")
         st.dataframe(coerce_arrow_safe(processed_df.head()))
