@@ -10,6 +10,7 @@ import concurrent.futures
 from io import BytesIO
 import csv
 import json
+import os
 from typing import Optional, Tuple, List, Dict
 
 # Try importing AreaFeature + PortProps from searoute (newer builds)
@@ -170,12 +171,13 @@ def nearest_point(tree, coords_array, names, target: Tuple[float, float]) -> Opt
 
 
 # ---------- Ports from local GeoJSON (with codes in display name) ----------
-@st.cache_data(show_spinner=False)
 def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str, Tuple[float, float]]]:
     """
     Load ports from a local GeoJSON file at 'ports.geojson'.
     Returns list of (display_name_with_code, (lat, lng)) like 'Prague (CZPRA)'.
     """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Local ports file '{path}' not found.")
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -194,6 +196,8 @@ def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str
         code = (props.get("port_id") or props.get("id") or "").strip()
         display = f"{name} ({code})" if code else name
         ports.append((display, (float(lat), float(lon))))
+    if not ports:
+        raise ValueError(f"No valid port points found in '{path}'.")
     return ports
 
 
@@ -264,77 +268,6 @@ def searoute_sea_km_between_ports(o_port_latlng: Tuple[float, float], d_port_lat
     return sea_km
 
 
-def searoute_with_ports(origin_coords: Tuple[float, float],
-                        destination_coords: Tuple[float, float],
-                        prefer_auto_ports: bool,
-                        origin_port_override: Optional[str],
-                        destination_port_override: Optional[str]):
-    """
-    Use searoute to compute sea path and extract chosen ports + their coordinates.
-    Returns:
-      sea_km: float
-      o_port_id: Optional[str]
-      d_port_id: Optional[str]
-      o_port_latlng: Optional[Tuple[float,float]]  # (lat, lng)
-      d_port_latlng: Optional[Tuple[float,float]]
-    """
-    o_lonlat = [origin_coords[1], origin_coords[0]]  # [lon, lat]
-    d_lonlat = [destination_coords[1], destination_coords[0]]
-
-    origin_feat = o_lonlat
-    dest_feat = d_lonlat
-    if _HAS_AREAFEATURE:
-        o_pref = PortProps(origin_port_override, 1) if (origin_port_override and origin_port_override.strip()) else None
-        d_pref = PortProps(destination_port_override, 1) if (destination_port_override and destination_port_override.strip()) else None
-        if prefer_auto_ports and not o_pref:
-            o_pref = []
-        if prefer_auto_ports and not d_pref:
-            d_pref = []
-        origin_feat = AreaFeature(coords=o_lonlat, name="Origin", preferred_ports=o_pref if o_pref is not None else None)
-        dest_feat = AreaFeature(coords=d_lonlat, name="Destination", preferred_ports=d_pref if d_pref is not None else None)
-
-    route = sr.searoute(origin_feat, dest_feat, units="naut")
-
-    sea_km = None
-    o_port_id = None
-    d_port_id = None
-    o_port_latlng = None
-    d_port_latlng = None
-
-    # Distance / metadata
-    if route and getattr(route, "properties", None):
-        props = route.properties
-        if "length" in props:
-            sea_km = float(props["length"]) * 1.852  # nmi -> km
-
-        # Port IDs (try several shapes)
-        o_port = props.get("origin_port") or props.get("start_port") or {}
-        d_port = props.get("destination_port") or props.get("end_port") or {}
-        o_port_id = (o_port.get("id") if isinstance(o_port, dict) else None) or props.get("origin_port_id") or props.get("start_port_id")
-        d_port_id = (d_port.get("id") if isinstance(d_port, dict) else None) or props.get("destination_port_id") or props.get("end_port_id")
-
-    # Extract port coordinates from geometry (LineString first/last point)
-    try:
-        geom = getattr(route, "geometry", None)
-        if isinstance(geom, dict):
-            coords = geom.get("coordinates")
-        else:
-            coords = getattr(geom, "coordinates", None)
-        if coords and isinstance(coords, (list, tuple)) and len(coords) >= 2:
-            o_lon, o_lat = coords[0]
-            d_lon, d_lat = coords[-1]
-            o_port_latlng = (float(o_lat), float(o_lon))
-            d_port_latlng = (float(d_lat), float(d_lon))
-    except Exception:
-        pass
-
-    # Fallback for distance if needed
-    if sea_km is None:
-        sea_km = geodesic((o_lonlat[1], o_lonlat[0]), (d_lonlat[1], d_lonlat[0])).kilometers
-
-    return sea_km, o_port_id, d_port_id, o_port_latlng, d_port_latlng
-
-
 # ---------- Arrow-safe preview ----------
 def coerce_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -359,15 +292,22 @@ def process_file(
 
     df = pd.read_excel(input_file)
 
-    # Ensure output columns
-    needed_cols = [
-        'Distance (km)', 'Source',
-        'Distance to hub (km)', 'Origin hub', 'Destination hub', 'Distance from hub (km)',
-        'Flight (km)', 'Sea (km)'
+    # Decide output columns based on the hub toggle
+    base_cols = ['Distance (km)', 'Source', 'Flight (km)', 'Sea (km)']
+    hub_cols = [
+        'Distance to hub (km)', 'Origin hub', 'Destination hub',
+        'Distance from hub (km)', 'Distance to/from hub (km)'
     ]
+    needed_cols = base_cols + (hub_cols if enable_hub_legs else [])
     for col in needed_cols:
         if col not in df.columns:
             df[col] = pd.NA
+
+    # If hub legs are disabled, also drop any lingering hub columns from prior runs
+    if not enable_hub_legs:
+        for col in hub_cols:
+            if col in df.columns:
+                df.drop(columns=[col], inplace=True)
 
     rows_to_process = df[df['Distance (km)'].isna()]
     if rows_to_process.empty:
@@ -395,21 +335,21 @@ def process_file(
             done += 1
             warmup_bar.progress(done / max(total, 1))
 
-    # Airports KD-tree
+    # Airports KD-tree (for air hubs)
     airports = load_international_airports("airports.csv")
     airport_tree, airport_names, airport_coords = build_kdtree(airports)
 
-    # Ports KD-tree from local GeoJSON
+    # Ports KD-tree from local GeoJSON (for sea hubs) — strictly enforced when hub legs ON
     ports_tree = None
     port_names: List[str] = []
     port_coords_arr = None
-    used_local_ports = False
-    try:
-        ports_list = load_ports_from_geojson_local("ports.geojson")
-        ports_tree, port_names, port_coords_arr = build_kdtree(ports_list)
-        used_local_ports = True
-    except Exception as e:
-        st.warning(f"Could not load local 'ports.geojson' ({e}). Falling back to searoute’s internal ports.")
+    if enable_hub_legs:
+        try:
+            ports_list = load_ports_from_geojson_local("ports.geojson")
+            ports_tree, port_names, port_coords_arr = build_kdtree(ports_list)
+        except Exception as e:
+            st.error(f"Required local 'ports.geojson' not available/valid: {e}")
+            st.stop()  # Enforce: no processing without the local file when hub legs are enabled
 
     # Grouping
     tmp = rows_to_process.copy()
@@ -434,11 +374,12 @@ def process_file(
         main_distance = None    # Distance (km): main-mode only
         source = None
 
-        # unified hub outputs
+        # hub outputs (only populated if enable_hub_legs)
         road_to_hub = pd.NA
         origin_hub_label = pd.NA
         destination_hub_label = pd.NA
         road_from_hub = pd.NA
+        road_sum_hub = pd.NA  # new combined column
 
         # QA legs
         flight_dist = pd.NA
@@ -468,8 +409,8 @@ def process_file(
 
             elif mode_lower in ["cargo ship (sea)", "sea", "ocean", "vessel (sea)"]:
                 if origin_coords and destination_coords:
-                    if enable_hub_legs and ports_tree is not None:
-                        # Use local ports.geojson to pick nearest ports; then route sea between them
+                    if enable_hub_legs:
+                        # Enforced: ports_tree must exist (we stopped earlier if not)
                         o_port = nearest_point(ports_tree, port_coords_arr, port_names, origin_coords)
                         d_port = nearest_point(ports_tree, port_coords_arr, port_names, destination_coords)
                         if o_port and d_port:
@@ -483,39 +424,19 @@ def process_file(
                             main_distance = sea_dist
                             source = "Shortest sea route between two points on Earth."
                         else:
-                            # fallback to searoute’s internal port selection
-                            sea_km, o_id, d_id, o_pll, d_pll = searoute_with_ports(
-                                origin_coords,
-                                destination_coords,
-                                prefer_auto_ports=True,
-                                origin_port_override=None,
-                                destination_port_override=None
-                            )
-                            sea_dist = sea_km
-                            if o_pll and d_pll:
-                                road_to_hub = road_km_between_latlng(origin_coords, o_pll)
-                                road_from_hub = road_km_between_latlng(d_pll, destination_coords)
-                            origin_hub_label = f"{o_id}" if o_id else pd.NA
-                            destination_hub_label = f"{d_id}" if d_id else pd.NA
+                            # If we can't find two ports, we still compute sea main distance without hubs
+                            sea_dist = geodesic(origin_coords, destination_coords).kilometers
                             main_distance = sea_dist
-                            source = "Sea (searoute)"
+                            source = "Shortest sea route between two points on Earth."
                     else:
-                        # No local ports KD-tree → use searoute internal ports or just searoute
-                        sea_km, o_id, d_id, o_pll, d_pll = searoute_with_ports(
-                            origin_coords,
-                            destination_coords,
-                            prefer_auto_ports=enable_hub_legs,
-                            origin_port_override=None,
-                            destination_port_override=None
-                        )
-                        sea_dist = sea_km
-                        if enable_hub_legs and o_pll and d_pll:
-                            road_to_hub = road_km_between_latlng(origin_coords, o_pll)
-                            road_from_hub = road_km_between_latlng(d_pll, destination_coords)
-                        origin_hub_label = f"{o_id}" if o_id else pd.NA
-                        destination_hub_label = f"{d_id}" if d_id else pd.NA
+                        # Hub legs disabled → just compute sea main distance with searoute between points
+                        route = sr.searoute([origin_coords[1], origin_coords[0]], [destination_coords[1], destination_coords[0]], units="naut")
+                        if route and getattr(route, "properties", None) and "length" in route.properties:
+                            sea_dist = float(route.properties["length"]) * 1.852
+                        else:
+                            sea_dist = geodesic(origin_coords, destination_coords).kilometers
                         main_distance = sea_dist
-                        source = "Sea (searoute)"
+                        source = "Shortest sea route between two points on Earth."
                 else:
                     main_distance = None
                     source = None
@@ -542,19 +463,38 @@ def process_file(
                     main_distance = geodesic(origin_coords, destination_coords).kilometers
                     source = "Geodesic Distance"
 
+            # Sum the two road legs into the combined column (only when hubs enabled and at least one leg present)
+            if enable_hub_legs:
+                if isinstance(road_to_hub, (int, float)) and road_to_hub is not pd.NA:
+                    to_val = float(road_to_hub)
+                else:
+                    to_val = None
+                if isinstance(road_from_hub, (int, float)) and road_from_hub is not pd.NA:
+                    from_val = float(road_from_hub)
+                else:
+                    from_val = None
+                if to_val is not None or from_val is not None:
+                    road_sum_hub = (to_val or 0.0) + (from_val or 0.0)
+
         except Exception as e:
             print(f"Error in group {group}: {e}")
 
-        return group, {
+        # Build row dict conditioned on hub toggle
+        row_out = {
             'Distance (km)': main_distance,
             'Source': source,
-            'Distance to hub (km)': road_to_hub,
-            'Origin hub': origin_hub_label,
-            'Destination hub': destination_hub_label,
-            'Distance from hub (km)': road_from_hub,
             'Flight (km)': flight_dist,
             'Sea (km)': sea_dist
         }
+        if enable_hub_legs:
+            row_out.update({
+                'Distance to hub (km)': road_to_hub,
+                'Origin hub': origin_hub_label,
+                'Destination hub': destination_hub_label,
+                'Distance from hub (km)': road_from_hub,
+                'Distance to/from hub (km)': road_sum_hub
+            })
+        return group, row_out
 
     # Run with progress bar
     st.write("Calculating distances…")
@@ -616,7 +556,7 @@ def main():
         )
 
         if enable_hub_legs:
-            st.caption("Ports are selected from local 'ports.geojson'. If not found, we fall back to searoute’s internal ports.")
+            st.caption("Ports must be provided by local 'ports.geojson'. No fallback is used.")
 
         st.write("Processed data preview:")
         st.dataframe(coerce_arrow_safe(processed_df.head()))
