@@ -559,7 +559,41 @@ def main():
 
     if not check_password():
         return
-
+        
+    with st.expander("📘 How to use this tool", expanded=True):
+        st.markdown("""
+        **1️⃣ Upload your file**
+    
+        - Upload an Excel file containing at least three columns:  
+          `From` (origin), `To` (destination), and `Mode` (e.g. *Road*, *Air*, *Sea*).  
+        - Each row represents one transport route.
+    
+        **2️⃣ Choose options**
+    
+        - Optionally enable *“nearest airport/port legs”* to include the road distance
+          to and from the nearest hubs.  
+        - When enabled, additional columns will appear for:
+          - `Origin hub`, `Destination hub`
+          - `Distance to hub (km)`, `Distance from hub (km)`
+          - `Distance to/from hub (km)` (sum of both)
+    
+        **3️⃣ Run the calculations**
+    
+        - Click “Process file” (this happens automatically after upload).  
+        - Watch the progress bars for geocoding and distance computation.
+    
+        **4️⃣ Review and download**
+    
+        - A preview of your processed data will appear below.  
+        - Use the **Download Processed File** button to export an `.xlsx` file.
+    
+        **🗺️ Notes**
+        - Road distances use **Google Maps API** (shortest route).
+        - Air distances use **Great Circle** calculations between airports.
+        - Sea distances use **Searoute shortest sea paths** between ports defined in your local `ports.geojson` file.
+        - All distances are in **kilometres (km)**.
+    """)
+    
     # Toggle for hub legs
     enable_hub_legs = st.checkbox(
         "Enable nearest airport/port legs (adds hub columns; NOT counted in Distance (km))", value=False
