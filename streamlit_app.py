@@ -9,7 +9,8 @@ import re
 import concurrent.futures
 from io import BytesIO
 import csv
-from typing import Optional, Tuple, List
+import json
+from typing import Optional, Tuple, List, Dict, Any
 
 # Try importing AreaFeature + PortProps from searoute (newer builds)
 try:
@@ -26,8 +27,8 @@ GEOCODING_API_ENDPOINT = "https://maps.googleapis.com/maps/api/geocode/json"
 API_KEY = st.secrets.google_api_key
 
 # Caches
-distance_cache = {}      # {(origin_norm, destination_norm): (distance_km, source)}
-coordinate_cache = {}    # {location_key: (lat, lng)}
+distance_cache: Dict[Tuple[str, str], Tuple[Optional[float], Optional[str]]] = {}
+coordinate_cache: Dict[str, Optional[Tuple[float, float]]] = {}
 
 # Coordinate regex
 _COORD_PATTERN_NE = re.compile(
@@ -121,7 +122,7 @@ def coords_for_location(s, api_key) -> Optional[Tuple[float, float]]:
 
 def load_international_airports(filename="airports.csv") -> List[Tuple[str, Tuple[float, float]]]:
     """Read airports (expects OpenFlights-like columns). Uses large/medium airports only."""
-    airports = []
+    airports: List[Tuple[str, Tuple[float, float]]] = []
     try:
         with open(filename, mode="r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -206,6 +207,59 @@ def road_km_between_latlng(a_latlng: Tuple[float, float], b_latlng: Tuple[float,
         except Exception:
             return None
     return dist
+
+
+@st.cache_data(show_spinner=False)
+def load_ports_from_geojson(source: str) -> List[Tuple[str, Tuple[float, float]]]:
+    """
+    Load ports from a GeoJSON file (URL or local path).
+    Returns a list of (display_name, (lat, lng)).
+    We try to build a readable name from properties like 'name' or 'port_id'.
+    """
+    text = None
+    if source.startswith("http://") or source.startswith("https://"):
+        r = requests.get(source, timeout=30)
+        r.raise_for_status()
+        text = r.text
+    else:
+        with open(source, "r", encoding="utf-8") as f:
+            text = f.read()
+
+    data = json.loads(text)
+    features = data.get("features", [])
+    ports: List[Tuple[str, Tuple[float, float]]] = []
+    for feat in features:
+        geom = feat.get("geometry", {})
+        props = feat.get("properties", {}) or {}
+        if geom.get("type") != "Point":
+            continue
+        coords = geom.get("coordinates")  # [lon, lat]
+        if not (isinstance(coords, (list, tuple)) and len(coords) == 2):
+            continue
+        lon, lat = coords
+        # Build a display name: prefer 'name', else 'port_id', else any id-ish field
+        name = props.get("name") or props.get("port_id") or props.get("id") or "PORT"
+        name = str(name).strip()
+        ports.append((name, (float(lat), float(lon))))
+    return ports
+
+
+def searoute_sea_km_between_ports(o_port_latlng: Tuple[float, float], d_port_latlng: Tuple[float, float]) -> float:
+    """
+    Use searoute between two known port coordinates.
+    Returns sea distance in km (falls back to GC if length not present).
+    """
+    o_lonlat = [o_port_latlng[1], o_port_latlng[0]]
+    d_lonlat = [d_port_latlng[1], d_port_latlng[0]]
+    route = sr.searoute(o_lonlat, d_lonlat, units="naut")
+    sea_km = None
+    if route and getattr(route, "properties", None):
+        props = route.properties
+        if "length" in props:
+            sea_km = float(props["length"]) * 1.852
+    if sea_km is None:
+        sea_km = geodesic((o_port_latlng[0], o_port_latlng[1]), (d_port_latlng[0], d_port_latlng[1])).kilometers
+    return sea_km
 
 
 def searoute_with_ports(origin_coords: Tuple[float, float],
@@ -295,11 +349,16 @@ def coerce_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def process_file(input_file,
-                 enable_hub_legs: bool,
-                 use_searoute_preferred_ports: bool,
-                 origin_port_override: Optional[str],
-                 destination_port_override: Optional[str]) -> pd.DataFrame:
+def process_file(
+    input_file,
+    enable_hub_legs: bool,
+    use_geojson_ports: bool,
+    ports_geojson_source: Optional[str],
+    use_searoute_preferred_ports: bool,
+    origin_port_override: Optional[str],
+    destination_port_override: Optional[str],
+) -> pd.DataFrame:
+
     df = pd.read_excel(input_file)
 
     # Ensure output columns
@@ -342,6 +401,20 @@ def process_file(input_file,
     # Airports KD-tree
     airports = load_international_airports("airports.csv")
     airport_tree, airport_names, airport_coords = build_kdtree(airports)
+
+    # Ports KD-tree from GeoJSON (optional)
+    ports_tree = None
+    port_names: List[str] = []
+    port_coords_arr = None
+    ports_list: List[Tuple[str, Tuple[float, float]]] = []
+
+    if enable_hub_legs and use_geojson_ports and ports_geojson_source:
+        try:
+            ports_list = load_ports_from_geojson(ports_geojson_source)
+            ports_tree, port_names, port_coords_arr = build_kdtree(ports_list)
+        except Exception as e:
+            st.warning(f"Could not load ports from GeoJSON source ({e}). Falling back to searoute’s internal ports.")
+            ports_tree, port_names, port_coords_arr = None, [], None
 
     # Grouping
     tmp = rows_to_process.copy()
@@ -401,25 +474,59 @@ def process_file(input_file,
 
             elif mode_lower in ["cargo ship (sea)", "sea", "ocean", "vessel (sea)"]:
                 if origin_coords and destination_coords:
-                    sea_km, o_port_id, d_port_id, o_port_latlng, d_port_latlng = searoute_with_ports(
-                        origin_coords,
-                        destination_coords,
-                        prefer_auto_ports=enable_hub_legs and use_searoute_preferred_ports,
-                        origin_port_override=origin_port_override,
-                        destination_port_override=destination_port_override
-                    )
-                    sea_dist = sea_km
-                    if o_port_id:
-                        origin_port_name = o_port_id
-                    if d_port_id:
-                        destination_port_name = d_port_id
-
-                    if enable_hub_legs and o_port_latlng and d_port_latlng:
-                        road_to_port = road_km_between_latlng(origin_coords, o_port_latlng)
-                        road_from_port = road_km_between_latlng(d_port_latlng, destination_coords)
-
-                    main_distance = sea_dist
-                    source = "Sea (searoute)"
+                    if enable_hub_legs and ports_tree is not None:
+                        # Use GeoJSON ports to pick nearest ports; then route sea between them
+                        o_port = nearest_point(ports_tree, port_coords_arr, port_names, origin_coords)
+                        d_port = nearest_point(ports_tree, port_coords_arr, port_names, destination_coords)
+                        if o_port and d_port:
+                            origin_port_name, o_port_latlng = o_port
+                            destination_port_name, d_port_latlng = d_port
+                            # road legs
+                            road_to_port = road_km_between_latlng(origin_coords, o_port_latlng)
+                            road_from_port = road_km_between_latlng(d_port_latlng, destination_coords)
+                            # sea leg
+                            sea_dist = searoute_sea_km_between_ports(o_port_latlng, d_port_latlng)
+                            main_distance = sea_dist
+                            source = "Sea (ports from ports.geojson)"
+                        else:
+                            # fallback to searoute’s internal port selection
+                            sea_km, o_id, d_id, o_pll, d_pll = searoute_with_ports(
+                                origin_coords,
+                                destination_coords,
+                                prefer_auto_ports=True,
+                                origin_port_override=None,
+                                destination_port_override=None
+                            )
+                            sea_dist = sea_km
+                            origin_port_name = o_id or origin_port_name
+                            destination_port_name = d_id or destination_port_name
+                            if o_pll and d_pll and enable_hub_legs:
+                                road_to_port = road_km_between_latlng(origin_coords, o_pll)
+                                road_from_port = road_km_between_latlng(d_pll, destination_coords)
+                            main_distance = sea_dist
+                            source = "Sea (searoute internal ports)"
+                    else:
+                        # No GeoJSON port KD-tree → use searoute internal ports as before
+                        sea_km, o_id, d_id, o_pll, d_pll = searoute_with_ports(
+                            origin_coords,
+                            destination_coords,
+                            prefer_auto_ports=enable_hub_legs and use_searoute_preferred_ports,
+                            origin_port_override=origin_port_override,
+                            destination_port_override=destination_port_override
+                        )
+                        sea_dist = sea_km
+                        if o_id:
+                            origin_port_name = o_id
+                        if d_id:
+                            destination_port_name = d_id
+                        if enable_hub_legs and o_pll and d_pll:
+                            road_to_port = road_km_between_latlng(origin_coords, o_pll)
+                            road_from_port = road_km_between_latlng(d_pll, destination_coords)
+                        main_distance = sea_dist
+                        source = "Sea (searoute)"
+                else:
+                    main_distance = None
+                    source = None
 
             elif mode_lower in ["truck (road)", "trucking", "courier", "van", "truck", "car"]:
                 origin_api = origin_key if ',' in origin_key else to_api_location_param(origin_key)
@@ -512,23 +619,40 @@ def main():
         "Enable nearest airport/port legs (adds road-to/from hub columns; NOT counted in Distance (km))", value=False
     )
 
+    use_geojson_ports = False
+    ports_geojson_source = None
     use_searoute_preferred_ports = False
     origin_port_override = None
     destination_port_override = None
 
     if enable_hub_legs:
         st.caption("Road-to/from hubs is shown in 'Road (km)'. 'Distance (km)' remains the main-mode distance only.")
-        if not _HAS_AREAFEATURE:
-            st.info("Your installed searoute version does not expose AreaFeature/PortProps; using direct coordinates only.")
-        else:
-            use_searoute_preferred_ports = st.checkbox(
-                "Use searoute preferred ports (auto select)",
-                value=True,
-                help="Let searoute pick suitable ports from its internal database."
-            )
-            with st.expander("Optional: override port IDs (e.g., USNYC)"):
-                origin_port_override = st.text_input("Origin port ID (optional)", value="").strip() or None
-                destination_port_override = st.text_input("Destination port ID (optional)", value="").strip() or None
+
+        # Option 1: Use ports.geojson
+        use_geojson_ports = st.checkbox(
+            "Use ports.geojson to pick nearest seaports",
+            value=True,
+            help="Loads ports from a GeoJSON (URL or local path) and chooses the nearest ports to origin/destination."
+        )
+        if use_geojson_ports:
+            ports_geojson_source = st.text_input(
+                "ports.geojson URL or local path",
+                value="https://raw.githubusercontent.com/genthalili/searoute-py/main/searoute/data/ports.geojson"
+            ).strip()
+
+        # Option 2: fall back to searoute internal ports
+        if not use_geojson_ports:
+            if not _HAS_AREAFEATURE:
+                st.info("Your installed searoute version does not expose AreaFeature/PortProps; using direct coordinates only.")
+            else:
+                use_searoute_preferred_ports = st.checkbox(
+                    "Use searoute preferred ports (auto select)",
+                    value=True,
+                    help="Let searoute pick suitable ports from its internal database."
+                )
+                with st.expander("Optional: override port IDs (e.g., USNYC)"):
+                    origin_port_override = st.text_input("Origin port ID (optional)", value="").strip() or None
+                    destination_port_override = st.text_input("Destination port ID (optional)", value="").strip() or None
 
     uploaded_file = st.file_uploader("Upload an Excel file", type=["xlsx"])
     if uploaded_file:
@@ -543,6 +667,8 @@ def main():
         processed_df = process_file(
             input_file,
             enable_hub_legs=enable_hub_legs,
+            use_geojson_ports=use_geojson_ports,
+            ports_geojson_source=ports_geojson_source,
             use_searoute_preferred_ports=use_searoute_preferred_ports,
             origin_port_override=origin_port_override,
             destination_port_override=destination_port_override
