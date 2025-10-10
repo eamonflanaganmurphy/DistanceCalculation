@@ -279,4 +279,301 @@ def searoute_with_ports(origin_coords: Tuple[float, float],
     return sea_km, o_port_id, d_port_id, o_port_latlng, d_port_latlng
 
 
-def coerce_arrow_safe(df: pd.DataFrame) -> pd
+def coerce_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make object-typed text columns Arrow-friendly by converting to Pandas 'string' dtype
+    for UI display only (does not mutate the working df).
+    """
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_object_dtype(out[col]):
+            try:
+                pd.to_numeric(out[col])
+                # If convertible to numeric, leave as-is
+            except Exception:
+                out[col] = out[col].astype("string")
+    return out
+
+
+def process_file(input_file,
+                 enable_hub_legs: bool,
+                 use_searoute_preferred_ports: bool,
+                 origin_port_override: Optional[str],
+                 destination_port_override: Optional[str]) -> pd.DataFrame:
+    df = pd.read_excel(input_file)
+
+    # Ensure output columns
+    needed_cols = [
+        'Distance (km)', 'Source',
+        'Road (km)',  # combined road legs
+        'RoadToAirport (km)', 'Flight (km)', 'RoadFromAirport (km)', 'Origin Airport', 'Destination Airport',
+        'RoadToPort (km)', 'Sea (km)', 'RoadFromPort (km)', 'Origin Port', 'Destination Port'
+    ]
+    for col in needed_cols:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    rows_to_process = df[df['Distance (km)'].isna()]
+    if rows_to_process.empty:
+        st.info("No new rows to process.")
+        return df
+
+    # Geocode warm-up
+    unique_addresses = set()
+    for _, r in rows_to_process.iterrows():
+        unique_addresses.add(str(r['From']).strip())
+        unique_addresses.add(str(r['To']).strip())
+
+    st.write("Geocoding unique locations…")
+    warmup_bar = st.progress(0)
+    unique_list = list(unique_addresses)
+
+    def _warmup(addr):
+        _ = coords_for_location(addr, API_KEY)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        futs = {ex.submit(_warmup, a): i for i, a in enumerate(unique_list)}
+        total = len(unique_list)
+        done = 0
+        for _ in concurrent.futures.as_completed(futs):
+            done += 1
+            warmup_bar.progress(done / max(total, 1))
+
+    # Airports KD-tree
+    airports = load_international_airports("airports.csv")
+    airport_tree, airport_names, airport_coords = build_kdtree(airports)
+
+    # Grouping
+    tmp = rows_to_process.copy()
+    tmp['group_key'] = tmp.apply(
+        lambda x: (
+            normalise_location_key(x.get('From')),
+            normalise_location_key(x.get('To')),
+            str(x.get('Mode', '')).strip().lower()
+        ),
+        axis=1
+    )
+    unique_groups = tmp['group_key'].unique()
+    results_cache = {}
+
+    # Core per-group computation
+    def process_group(group):
+        origin_key, destination_key, mode_lower = group
+        origin_coords = coordinate_cache.get(origin_key) or coords_for_location(origin_key, API_KEY)
+        destination_coords = coordinate_cache.get(destination_key) or coords_for_location(destination_key, API_KEY)
+
+        distance = None
+        source = None
+
+        # Initial leg fields
+        road_to_airport = pd.NA
+        flight_dist = pd.NA
+        road_from_airport = pd.NA
+        origin_airport_name = pd.NA
+        destination_airport_name = pd.NA
+
+        road_to_port = pd.NA
+        sea_dist = pd.NA
+        road_from_port = pd.NA
+        origin_port_name = pd.NA
+        destination_port_name = pd.NA
+
+        try:
+            if mode_lower in ["air", "airplane (air)", "flight"]:
+                if enable_hub_legs and origin_coords and destination_coords and airport_tree is not None:
+                    o_air = nearest_point(airport_tree, airport_coords, airport_names, origin_coords)
+                    d_air = nearest_point(airport_tree, airport_coords, airport_names, destination_coords)
+                    if o_air and d_air:
+                        origin_airport_name, o_air_coords = o_air
+                        destination_airport_name, d_air_coords = d_air
+                        road_to_airport = road_km_between_latlng(origin_coords, o_air_coords)
+                        road_from_airport = road_km_between_latlng(d_air_coords, destination_coords)
+                        flight_dist = geodesic(o_air_coords, d_air_coords).kilometers
+                        road_total = (road_to_airport or 0) + (road_from_airport or 0)
+                        distance = road_total + (flight_dist or 0)
+                        source = "Road + Airport GC"
+                    else:
+                        if origin_coords and destination_coords:
+                            flight_dist = geodesic(origin_coords, destination_coords).kilometers
+                            road_total = 0
+                            distance = flight_dist
+                            source = "Geodesic Air Distance"
+                else:
+                    if origin_coords and destination_coords:
+                        flight_dist = geodesic(origin_coords, destination_coords).kilometers
+                        road_total = 0
+                        distance = flight_dist
+                        source = "Geodesic Air Distance"
+
+            elif mode_lower in ["cargo ship (sea)", "sea", "ocean", "vessel (sea)"]:
+                if origin_coords and destination_coords:
+                    sea_km, o_port_id, d_port_id, o_port_latlng, d_port_latlng = searoute_with_ports(
+                        origin_coords,
+                        destination_coords,
+                        prefer_auto_ports=enable_hub_legs and use_searoute_preferred_ports,
+                        origin_port_override=origin_port_override,
+                        destination_port_override=destination_port_override
+                    )
+                    sea_dist = sea_km
+                    if o_port_id:
+                        origin_port_name = o_port_id
+                    if d_port_id:
+                        destination_port_name = d_port_id
+
+                    road_total = 0
+                    if enable_hub_legs:
+                        if o_port_latlng and d_port_latlng:
+                            road_to_port = road_km_between_latlng(origin_coords, o_port_latlng)
+                            road_from_port = road_km_between_latlng(d_port_latlng, destination_coords)
+                            road_total = (road_to_port or 0) + (road_from_port or 0)
+                        # else: keep road_total at 0 if we couldn't extract port coords
+
+                    distance = road_total + (sea_dist or 0)
+                    source = "SeaRoute (ports via geometry) + Road" if enable_hub_legs else "SeaRoute (ports internal)"
+                else:
+                    distance = None
+                    source = None
+
+            elif mode_lower in ["truck (road)", "trucking", "courier", "van", "truck", "car"]:
+                origin_api = origin_key if ',' in origin_key else to_api_location_param(origin_key)
+                dest_api = destination_key if ',' in destination_key else to_api_location_param(destination_key)
+                dist, src = get_distance_matrix(origin_api, dest_api, API_KEY)
+                if dist is None and origin_coords and destination_coords:
+                    dist = geodesic(origin_coords, destination_coords).kilometers
+                    src = "Geodesic Distance"
+                distance, source = dist, src
+
+            else:
+                origin_api = origin_key if ',' in origin_key else to_api_location_param(origin_key)
+                dest_api = destination_key if ',' in destination_key else to_api_location_param(destination_key)
+                dist, src = get_distance_matrix(origin_api, dest_api, API_KEY)
+                if dist is not None:
+                    distance, source = dist, src
+                elif origin_coords and destination_coords:
+                    distance = geodesic(origin_coords, destination_coords).kilometers
+                    source = "Geodesic Distance"
+
+        except Exception as e:
+            print(f"Error in group {group}: {e}")
+
+        # Combined road column
+        road_combined = 0
+        for v in [road_to_airport, road_from_airport, road_to_port, road_from_port]:
+            if isinstance(v, (int, float)) and v is not pd.NA:
+                road_combined += v
+        if distance is None:
+            road_combined = pd.NA
+
+        return group, {
+            'Distance (km)': distance,
+            'Source': source,
+            'Road (km)': road_combined,
+            'RoadToAirport (km)': road_to_airport,
+            'Flight (km)': flight_dist,
+            'RoadFromAirport (km)': road_from_airport,
+            'Origin Airport': origin_airport_name,
+            'Destination Airport': destination_airport_name,
+            'RoadToPort (km)': road_to_port,
+            'Sea (km)': sea_dist,
+            'RoadFromPort (km)': road_from_port,
+            'Origin Port': origin_port_name,
+            'Destination Port': destination_port_name
+        }
+
+    # Run with progress bar
+    st.write("Calculating distances…")
+    progress_bar = st.progress(0)
+    results_cache.clear()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        futs = {ex.submit(process_group, g): g for g in unique_groups}
+        total = len(unique_groups)
+        done = 0
+        for f in concurrent.futures.as_completed(futs):
+            g, res = f.result()
+            results_cache[g] = res
+            done += 1
+            progress_bar.progress(done / max(total, 1))
+
+    # Write results back using original row indices
+    for idx, row in rows_to_process.iterrows():
+        gk = (
+            normalise_location_key(row.get('From')),
+            normalise_location_key(row.get('To')),
+            str(row.get('Mode', '')).strip().lower()
+        )
+        res = results_cache.get(gk, {})
+        for k, v in res.items():
+            df.at[idx, k] = v
+
+    # Clean helper col if present
+    if 'group_key' in df.columns:
+        df.drop(columns=['group_key'], inplace=True, errors='ignore')
+
+    return df
+
+
+def main():
+    st.title("Distance Calculation")
+    st.write("Upload an Excel file with headers **From**, **To**, and **Mode**.")
+
+    if not check_password():
+        return
+
+    # Options
+    enable_hub_legs = st.checkbox(
+        "Enable nearest airport/port legs (adds road-to/from hub and flight/sea legs)", value=False
+    )
+
+    use_searoute_preferred_ports = False
+    origin_port_override = None
+    destination_port_override = None
+
+    if enable_hub_legs:
+        st.caption("When hub legs are enabled, road-to/from hub distances are consolidated in 'Road (km)'.")
+        if not _HAS_AREAFEATURE:
+            st.info("Your installed searoute version does not expose AreaFeature/PortProps; using direct coordinates only.")
+        else:
+            use_searoute_preferred_ports = st.checkbox(
+                "Use searoute preferred ports (auto select)",
+                value=True,
+                help="Let searoute pick suitable ports from its internal database."
+            )
+            with st.expander("Optional: override port IDs (e.g., USNYC)"):
+                origin_port_override = st.text_input("Origin port ID (optional)", value="").strip() or None
+                destination_port_override = st.text_input("Destination port ID (optional)", value="").strip() or None
+
+    uploaded_file = st.file_uploader("Upload an Excel file", type=["xlsx"])
+    if uploaded_file:
+        input_file = BytesIO(uploaded_file.read())
+        df = pd.read_excel(input_file)
+
+        # UI-safe preview
+        st.write("Input data preview:")
+        st.dataframe(coerce_arrow_safe(df.head()))
+
+        st.write("Processing file…")
+        processed_df = process_file(
+            input_file,
+            enable_hub_legs=enable_hub_legs,
+            use_searoute_preferred_ports=use_searoute_preferred_ports,
+            origin_port_override=origin_port_override,
+            destination_port_override=destination_port_override
+        )
+
+        st.write("Processed data preview:")
+        st.dataframe(coerce_arrow_safe(processed_df.head()))
+
+        # Download
+        output_file = BytesIO()
+        processed_df.to_excel(output_file, index=False)
+        output_file.seek(0)
+        st.download_button(
+            label="Download processed file",
+            data=output_file,
+            file_name="processed_file.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+
+if __name__ == "__main__":
+    main()
