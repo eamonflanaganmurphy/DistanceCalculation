@@ -176,6 +176,7 @@ def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str
     """
     Load ports from a local GeoJSON file at 'ports.geojson'.
     Returns list of (display_name_with_code, (lat, lng)) like 'Piombino (TPIO)'.
+    Tries several property keys to find a port code.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Local ports file '{path}' not found.")
@@ -184,6 +185,16 @@ def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str
 
     features = data.get("features", [])
     ports: List[Tuple[str, Tuple[float, float]]] = []
+
+    def _first_str(*vals) -> Optional[str]:
+        for v in vals:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            # some datasets put a single code in a 1-item list
+            if isinstance(v, (list, tuple)) and v and isinstance(v[0], str) and v[0].strip():
+                return v[0].strip()
+        return None
+
     for feat in features:
         geom = feat.get("geometry", {})
         props = feat.get("properties", {}) or {}
@@ -192,18 +203,30 @@ def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str
         coords = geom.get("coordinates")  # [lon, lat]
         if not (isinstance(coords, (list, tuple)) and len(coords) == 2):
             continue
+
         lon, lat = coords
-        name_raw = (props.get("name") or props.get("port_name") or "Port").strip()
-        code_raw = (props.get("port_id") or props.get("id") or "").strip()
-        code = code_raw.upper() if code_raw else ""
-        # Ensure we always append the code if present, e.g. "Piombino (TPIO)"
-        if code and name_raw.endswith(f"({code})"):
-            display = name_raw  # already has code
-        elif code:
+        name_raw = _first_str(props.get("name"), props.get("port_name"), props.get("Name"), "Port") or "Port"
+
+        # Try multiple possible keys for the port code
+        code_raw = _first_str(
+            props.get("port_id"),
+            props.get("id"),
+            props.get("locode"),
+            props.get("LOCODE"),
+            props.get("code"),
+            props.get("unlocs"),        # sometimes used in other datasets
+        )
+
+        code = code_raw.upper().replace(" ", "") if code_raw else ""
+
+        # Always append code if present and not already present at the end
+        if code and not name_raw.rstrip().endswith(f"({code})"):
             display = f"{name_raw} ({code})"
         else:
             display = name_raw
+
         ports.append((display, (float(lat), float(lon))))
+
     if not ports:
         raise ValueError(f"No valid port points found in '{path}'.")
     return ports
