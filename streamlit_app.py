@@ -48,19 +48,25 @@ def check_password():
         return True
 
 if check_password():
-    def try_parse_coordinates(s) -> Optional[Tuple[float,float]]:
-        if not isinstance(s, str): return None
-        text = s.strip()
-        m = __COORD_PATTERN_NE.match(text)
+    def try_parse_coordinates(s) -> Optional[Tuple[float, float]]:
+        if s is None:
+            return None
+        text = str(s).strip()  # robust to ints/floats/etc.
+    
+        m = _COORD_PATTERN_NE.match(text)
         if m:
             lat_val, lat_hem, lng_val, lng_hem = m.groups()
-            lat = float(lat_val); lng = float(lng_val)
-            lat = -abs(lat) if lat_hem.upper()=='S' else abs(lat)
-            lng = -abs(lng) if lng_hem.upper()=='W' else abs(lng)
+            lat = float(lat_val)
+            lng = float(lng_val)
+            lat = -abs(lat) if lat_hem.upper() == 'S' else abs(lat)
+            lng = -abs(lng) if lng_hem.upper() == 'W' else abs(lng)
             return (lat, lng)
-        m = __COORD_PATTERN_PLAIN.match(text)
+    
+        m = _COORD_PATTERN_PLAIN.match(text)
         if m:
-            lat, lng = map(float, m.groups()); return (lat, lng)
+            lat, lng = map(float, m.groups())
+            return (lat, lng)
+    
         return None
 
     def normalise_location_key(s) -> str:
