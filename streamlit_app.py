@@ -554,7 +554,7 @@ def process_file(
 
 
 def main():
-    st.title("Distance Calculation")
+    st.title("🌍 Distance Calculation Tool")
     st.caption("Automatically calculates road, air, and sea transport distances between locations for GHG emissions inventory calculations.")
 
     if not check_password():
