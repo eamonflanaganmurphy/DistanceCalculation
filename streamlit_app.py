@@ -140,7 +140,8 @@ def load_international_airports(filename="airports.csv") -> List[Tuple[str, Tupl
                     name = (row.get("name") or "").strip()
                     lat = float((row.get("latitude_deg") or "").strip())
                     lng = float((row.get("longitude_deg") or "").strip())
-                    code = (row.get("iata_code") or "").strip() or (row.get("ident") or "").strip() or (row.get("gps_code") or "").strip()
+                    code_raw = (row.get("iata_code") or "").strip() or (row.get("ident") or "").strip() or (row.get("gps_code") or "").strip()
+                    code = code_raw.upper() if code_raw else ""
                     display = f"{name} ({code})" if code else name
                     if name:
                         airports.append((display, (lat, lng)))
@@ -174,7 +175,7 @@ def nearest_point(tree, coords_array, names, target: Tuple[float, float]) -> Opt
 def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str, Tuple[float, float]]]:
     """
     Load ports from a local GeoJSON file at 'ports.geojson'.
-    Returns list of (display_name_with_code, (lat, lng)) like 'Prague (CZPRA)'.
+    Returns list of (display_name_with_code, (lat, lng)) like 'Piombino (TPIO)'.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Local ports file '{path}' not found.")
@@ -192,9 +193,16 @@ def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str
         if not (isinstance(coords, (list, tuple)) and len(coords) == 2):
             continue
         lon, lat = coords
-        name = (props.get("name") or props.get("port_name") or "Port").strip()
-        code = (props.get("port_id") or props.get("id") or "").strip()
-        display = f"{name} ({code})" if code else name
+        name_raw = (props.get("name") or props.get("port_name") or "Port").strip()
+        code_raw = (props.get("port_id") or props.get("id") or "").strip()
+        code = code_raw.upper() if code_raw else ""
+        # Ensure we always append the code if present, e.g. "Piombino (TPIO)"
+        if code and name_raw.endswith(f"({code})"):
+            display = name_raw  # already has code
+        elif code:
+            display = f"{name_raw} ({code})"
+        else:
+            display = name_raw
         ports.append((display, (float(lat), float(lon))))
     if not ports:
         raise ValueError(f"No valid port points found in '{path}'.")
@@ -379,7 +387,7 @@ def process_file(
         origin_hub_label = pd.NA
         destination_hub_label = pd.NA
         road_from_hub = pd.NA
-        road_sum_hub = pd.NA  # new combined column
+        road_sum_hub = pd.NA  # combined
 
         # QA legs
         flight_dist = pd.NA
@@ -424,7 +432,7 @@ def process_file(
                             main_distance = sea_dist
                             source = "Shortest sea route between two points on Earth."
                         else:
-                            # If we can't find two ports, we still compute sea main distance without hubs
+                            # If we can't find two ports, still compute main sea distance without hubs
                             sea_dist = geodesic(origin_coords, destination_coords).kilometers
                             main_distance = sea_dist
                             source = "Shortest sea route between two points on Earth."
@@ -465,14 +473,8 @@ def process_file(
 
             # Sum the two road legs into the combined column (only when hubs enabled and at least one leg present)
             if enable_hub_legs:
-                if isinstance(road_to_hub, (int, float)) and road_to_hub is not pd.NA:
-                    to_val = float(road_to_hub)
-                else:
-                    to_val = None
-                if isinstance(road_from_hub, (int, float)) and road_from_hub is not pd.NA:
-                    from_val = float(road_from_hub)
-                else:
-                    from_val = None
+                to_val = float(road_to_hub) if isinstance(road_to_hub, (int, float)) and road_to_hub is not pd.NA else None
+                from_val = float(road_from_hub) if isinstance(road_from_hub, (int, float)) and road_from_hub is not pd.NA else None
                 if to_val is not None or from_val is not None:
                     road_sum_hub = (to_val or 0.0) + (from_val or 0.0)
 
@@ -556,7 +558,7 @@ def main():
         )
 
         if enable_hub_legs:
-            st.caption("Ports must be provided by local 'ports.geojson'. No fallback is used.")
+            st.caption("Ports are selected from local 'ports.geojson' (codes included in hub names). No fallback is used.")
 
         st.write("Processed data preview:")
         st.dataframe(coerce_arrow_safe(processed_df.head()))
