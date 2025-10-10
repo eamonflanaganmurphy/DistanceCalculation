@@ -305,7 +305,7 @@ def process_file(input_file,
     # Ensure output columns
     needed_cols = [
         'Distance (km)', 'Source',
-        'Road (km)',  # combined road legs
+        'Road (km)',  # combined road legs (to/from hub)
         'RoadToAirport (km)', 'Flight (km)', 'RoadFromAirport (km)', 'Origin Airport', 'Destination Airport',
         'RoadToPort (km)', 'Sea (km)', 'RoadFromPort (km)', 'Origin Port', 'Destination Port'
     ]
@@ -362,10 +362,10 @@ def process_file(input_file,
         origin_coords = coordinate_cache.get(origin_key) or coords_for_location(origin_key, API_KEY)
         destination_coords = coordinate_cache.get(destination_key) or coords_for_location(destination_key, API_KEY)
 
-        distance = None
+        # Outputs (initialise)
+        main_distance = None    # <-- Distance (km): main-mode only
         source = None
 
-        # Initial leg fields
         road_to_airport = pd.NA
         flight_dist = pd.NA
         road_from_airport = pd.NA
@@ -380,30 +380,24 @@ def process_file(input_file,
 
         try:
             if mode_lower in ["air", "airplane (air)", "flight"]:
-                if enable_hub_legs and origin_coords and destination_coords and airport_tree is not None:
-                    o_air = nearest_point(airport_tree, airport_coords, airport_names, origin_coords)
-                    d_air = nearest_point(airport_tree, airport_coords, airport_names, destination_coords)
-                    if o_air and d_air:
-                        origin_airport_name, o_air_coords = o_air
-                        destination_airport_name, d_air_coords = d_air
-                        road_to_airport = road_km_between_latlng(origin_coords, o_air_coords)
-                        road_from_airport = road_km_between_latlng(d_air_coords, destination_coords)
-                        flight_dist = geodesic(o_air_coords, d_air_coords).kilometers
-                        road_total = (road_to_airport or 0) + (road_from_airport or 0)
-                        distance = road_total + (flight_dist or 0)
-                        source = "Road + Airport GC"
-                    else:
-                        if origin_coords and destination_coords:
+                if origin_coords and destination_coords:
+                    # Determine airports & road legs (if enabled), but main_distance is FLIGHT ONLY
+                    if enable_hub_legs and airport_tree is not None:
+                        o_air = nearest_point(airport_tree, airport_coords, airport_names, origin_coords)
+                        d_air = nearest_point(airport_tree, airport_coords, airport_names, destination_coords)
+                        if o_air and d_air:
+                            origin_airport_name, o_air_coords = o_air
+                            destination_airport_name, d_air_coords = d_air
+                            road_to_airport = road_km_between_latlng(origin_coords, o_air_coords)
+                            road_from_airport = road_km_between_latlng(d_air_coords, destination_coords)
+                            flight_dist = geodesic(o_air_coords, d_air_coords).kilometers
+                        else:
                             flight_dist = geodesic(origin_coords, destination_coords).kilometers
-                            road_total = 0
-                            distance = flight_dist
-                            source = "Geodesic Air Distance"
-                else:
-                    if origin_coords and destination_coords:
+                    else:
                         flight_dist = geodesic(origin_coords, destination_coords).kilometers
-                        road_total = 0
-                        distance = flight_dist
-                        source = "Geodesic Air Distance"
+
+                    main_distance = flight_dist
+                    source = "Air (GC between airports or points)"
 
             elif mode_lower in ["cargo ship (sea)", "sea", "ocean", "vessel (sea)"]:
                 if origin_coords and destination_coords:
@@ -420,19 +414,12 @@ def process_file(input_file,
                     if d_port_id:
                         destination_port_name = d_port_id
 
-                    road_total = 0
-                    if enable_hub_legs:
-                        if o_port_latlng and d_port_latlng:
-                            road_to_port = road_km_between_latlng(origin_coords, o_port_latlng)
-                            road_from_port = road_km_between_latlng(d_port_latlng, destination_coords)
-                            road_total = (road_to_port or 0) + (road_from_port or 0)
-                        # else: keep road_total at 0 if we couldn't extract port coords
+                    if enable_hub_legs and o_port_latlng and d_port_latlng:
+                        road_to_port = road_km_between_latlng(origin_coords, o_port_latlng)
+                        road_from_port = road_km_between_latlng(d_port_latlng, destination_coords)
 
-                    distance = road_total + (sea_dist or 0)
-                    source = "SeaRoute (ports via geometry) + Road" if enable_hub_legs else "SeaRoute (ports internal)"
-                else:
-                    distance = None
-                    source = None
+                    main_distance = sea_dist
+                    source = "Sea (searoute)"
 
             elif mode_lower in ["truck (road)", "trucking", "courier", "van", "truck", "car"]:
                 origin_api = origin_key if ',' in origin_key else to_api_location_param(origin_key)
@@ -441,31 +428,32 @@ def process_file(input_file,
                 if dist is None and origin_coords and destination_coords:
                     dist = geodesic(origin_coords, destination_coords).kilometers
                     src = "Geodesic Distance"
-                distance, source = dist, src
+                main_distance, source = dist, (src or "Road Distance")
 
             else:
+                # default: treat like road
                 origin_api = origin_key if ',' in origin_key else to_api_location_param(origin_key)
                 dest_api = destination_key if ',' in destination_key else to_api_location_param(destination_key)
                 dist, src = get_distance_matrix(origin_api, dest_api, API_KEY)
                 if dist is not None:
-                    distance, source = dist, src
+                    main_distance, source = dist, src
                 elif origin_coords and destination_coords:
-                    distance = geodesic(origin_coords, destination_coords).kilometers
+                    main_distance = geodesic(origin_coords, destination_coords).kilometers
                     source = "Geodesic Distance"
 
         except Exception as e:
             print(f"Error in group {group}: {e}")
 
-        # Combined road column
+        # Combined road column (for hub modes). NOT added into Distance (km).
         road_combined = 0
         for v in [road_to_airport, road_from_airport, road_to_port, road_from_port]:
             if isinstance(v, (int, float)) and v is not pd.NA:
                 road_combined += v
-        if distance is None:
+        if main_distance is None:
             road_combined = pd.NA
 
         return group, {
-            'Distance (km)': distance,
+            'Distance (km)': main_distance,
             'Source': source,
             'Road (km)': road_combined,
             'RoadToAirport (km)': road_to_airport,
@@ -521,7 +509,7 @@ def main():
 
     # Options
     enable_hub_legs = st.checkbox(
-        "Enable nearest airport/port legs (adds road-to/from hub and flight/sea legs)", value=False
+        "Enable nearest airport/port legs (adds road-to/from hub columns; NOT counted in Distance (km))", value=False
     )
 
     use_searoute_preferred_ports = False
@@ -529,7 +517,7 @@ def main():
     destination_port_override = None
 
     if enable_hub_legs:
-        st.caption("When hub legs are enabled, road-to/from hub distances are consolidated in 'Road (km)'.")
+        st.caption("Road-to/from hubs is shown in 'Road (km)'. 'Distance (km)' remains the main-mode distance only.")
         if not _HAS_AREAFEATURE:
             st.info("Your installed searoute version does not expose AreaFeature/PortProps; using direct coordinates only.")
         else:
