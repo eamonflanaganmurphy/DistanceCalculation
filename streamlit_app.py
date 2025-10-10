@@ -10,7 +10,7 @@ import concurrent.futures
 from io import BytesIO
 import csv
 import json
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict
 
 # Try importing AreaFeature + PortProps from searoute (newer builds)
 try:
@@ -120,22 +120,29 @@ def coords_for_location(s, api_key) -> Optional[Tuple[float, float]]:
     return coords
 
 
+# ---------- Airports (with codes in display name) ----------
 def load_international_airports(filename="airports.csv") -> List[Tuple[str, Tuple[float, float]]]:
-    """Read airports (expects OpenFlights-like columns). Uses large/medium airports only."""
+    """
+    Read airports (expects columns such as: name, latitude_deg, longitude_deg, type, iata_code or ident/gps_code).
+    Uses only large/medium airports.
+    Returns list of (display_name_with_code, (lat, lng)).
+    """
     airports: List[Tuple[str, Tuple[float, float]]] = []
     try:
         with open(filename, mode="r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                t = row.get("type", "").strip().lower()
+                t = (row.get("type") or "").strip().lower()
                 if t not in ("large_airport", "medium_airport"):
                     continue
                 try:
-                    name = row["name"].strip()
-                    lat = float(row["latitude_deg"].strip())
-                    lng = float(row["longitude_deg"].strip())
+                    name = (row.get("name") or "").strip()
+                    lat = float((row.get("latitude_deg") or "").strip())
+                    lng = float((row.get("longitude_deg") or "").strip())
+                    code = (row.get("iata_code") or "").strip() or (row.get("ident") or "").strip() or (row.get("gps_code") or "").strip()
+                    display = f"{name} ({code})" if code else name
                     if name:
-                        airports.append((name, (lat, lng)))
+                        airports.append((display, (lat, lng)))
                 except Exception:
                     continue
     except FileNotFoundError:
@@ -149,7 +156,7 @@ def build_kdtree(points: List[Tuple[str, Tuple[float, float]]]):
         return None, [], None
     coords = np.array([[p[1][0], p[1][1]] for p in points], dtype=float)
     tree = cKDTree(coords)
-    names = [p[0] for p in points]
+    names = [p[0] for p in points]  # already includes codes in display
     return tree, names, coords
 
 
@@ -162,6 +169,42 @@ def nearest_point(tree, coords_array, names, target: Tuple[float, float]) -> Opt
     return (name, (float(lat), float(lng)))
 
 
+# ---------- Ports from GeoJSON (with codes in display name) ----------
+@st.cache_data(show_spinner=False)
+def load_ports_from_geojson(source: str) -> List[Tuple[str, Tuple[float, float]]]:
+    """
+    Load ports from a GeoJSON file (URL or local path).
+    Returns list of (display_name_with_code, (lat, lng)) like 'Prague (CZPRA)'.
+    """
+    text = None
+    if source.startswith("http://") or source.startswith("https://"):
+        r = requests.get(source, timeout=30)
+        r.raise_for_status()
+        text = r.text
+    else:
+        with open(source, "r", encoding="utf-8") as f:
+            text = f.read()
+
+    data = json.loads(text)
+    features = data.get("features", [])
+    ports: List[Tuple[str, Tuple[float, float]]] = []
+    for feat in features:
+        geom = feat.get("geometry", {})
+        props = feat.get("properties", {}) or {}
+        if geom.get("type") != "Point":
+            continue
+        coords = geom.get("coordinates")  # [lon, lat]
+        if not (isinstance(coords, (list, tuple)) and len(coords) == 2):
+            continue
+        lon, lat = coords
+        name = (props.get("name") or props.get("port_name") or "Port").strip()
+        code = (props.get("port_id") or props.get("id") or "").strip()
+        display = f"{name} ({code})" if code else name
+        ports.append((display, (float(lat), float(lon))))
+    return ports
+
+
+# ---------- Distance helpers ----------
 def get_distance_matrix(origin, destination, api_key):
     """Road distance via Google Distance Matrix. Accepts address strings or 'lat,lng' strings."""
     origin_key = normalise_location_key(origin)
@@ -209,41 +252,7 @@ def road_km_between_latlng(a_latlng: Tuple[float, float], b_latlng: Tuple[float,
     return dist
 
 
-@st.cache_data(show_spinner=False)
-def load_ports_from_geojson(source: str) -> List[Tuple[str, Tuple[float, float]]]:
-    """
-    Load ports from a GeoJSON file (URL or local path).
-    Returns a list of (display_name, (lat, lng)).
-    We try to build a readable name from properties like 'name' or 'port_id'.
-    """
-    text = None
-    if source.startswith("http://") or source.startswith("https://"):
-        r = requests.get(source, timeout=30)
-        r.raise_for_status()
-        text = r.text
-    else:
-        with open(source, "r", encoding="utf-8") as f:
-            text = f.read()
-
-    data = json.loads(text)
-    features = data.get("features", [])
-    ports: List[Tuple[str, Tuple[float, float]]] = []
-    for feat in features:
-        geom = feat.get("geometry", {})
-        props = feat.get("properties", {}) or {}
-        if geom.get("type") != "Point":
-            continue
-        coords = geom.get("coordinates")  # [lon, lat]
-        if not (isinstance(coords, (list, tuple)) and len(coords) == 2):
-            continue
-        lon, lat = coords
-        # Build a display name: prefer 'name', else 'port_id', else any id-ish field
-        name = props.get("name") or props.get("port_id") or props.get("id") or "PORT"
-        name = str(name).strip()
-        ports.append((name, (float(lat), float(lon))))
-    return ports
-
-
+# ---------- Searoute wrappers ----------
 def searoute_sea_km_between_ports(o_port_latlng: Tuple[float, float], d_port_latlng: Tuple[float, float]) -> float:
     """
     Use searoute between two known port coordinates.
@@ -333,6 +342,7 @@ def searoute_with_ports(origin_coords: Tuple[float, float],
     return sea_km, o_port_id, d_port_id, o_port_latlng, d_port_latlng
 
 
+# ---------- Arrow-safe preview ----------
 def coerce_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
     """
     Make object-typed text columns Arrow-friendly by converting to Pandas 'string' dtype
@@ -349,6 +359,7 @@ def coerce_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# ---------- Main processing ----------
 def process_file(
     input_file,
     enable_hub_legs: bool,
@@ -364,9 +375,8 @@ def process_file(
     # Ensure output columns
     needed_cols = [
         'Distance (km)', 'Source',
-        'Road (km)',  # combined road legs (to/from hub)
-        'RoadToAirport (km)', 'Flight (km)', 'RoadFromAirport (km)', 'Origin Airport', 'Destination Airport',
-        'RoadToPort (km)', 'Sea (km)', 'RoadFromPort (km)', 'Origin Port', 'Destination Port'
+        'Distance to hub (km)', 'Hub', 'Distance from hub (km)',  # unified hub columns
+        'Flight (km)', 'Sea (km)'  # keep main-mode leg detail for QA
     ]
     for col in needed_cols:
         if col not in df.columns:
@@ -406,8 +416,6 @@ def process_file(
     ports_tree = None
     port_names: List[str] = []
     port_coords_arr = None
-    ports_list: List[Tuple[str, Tuple[float, float]]] = []
-
     if enable_hub_legs and use_geojson_ports and ports_geojson_source:
         try:
             ports_list = load_ports_from_geojson(ports_geojson_source)
@@ -436,35 +444,34 @@ def process_file(
         destination_coords = coordinate_cache.get(destination_key) or coords_for_location(destination_key, API_KEY)
 
         # Outputs (initialise)
-        main_distance = None    # <-- Distance (km): main-mode only
+        main_distance = None    # Distance (km): main-mode only
         source = None
 
-        road_to_airport = pd.NA
-        flight_dist = pd.NA
-        road_from_airport = pd.NA
-        origin_airport_name = pd.NA
-        destination_airport_name = pd.NA
+        # unified hub outputs
+        road_to_hub = pd.NA
+        hub_label = pd.NA
+        road_from_hub = pd.NA
 
-        road_to_port = pd.NA
+        # QA legs
+        flight_dist = pd.NA
         sea_dist = pd.NA
-        road_from_port = pd.NA
-        origin_port_name = pd.NA
-        destination_port_name = pd.NA
 
         try:
             if mode_lower in ["air", "airplane (air)", "flight"]:
                 if origin_coords and destination_coords:
-                    # Determine airports & road legs (if enabled), but main_distance is FLIGHT ONLY
+                    # Airports + road legs (if enabled), but Distance (km) is FLIGHT ONLY
                     if enable_hub_legs and airport_tree is not None:
                         o_air = nearest_point(airport_tree, airport_coords, airport_names, origin_coords)
                         d_air = nearest_point(airport_tree, airport_coords, airport_names, destination_coords)
                         if o_air and d_air:
-                            origin_airport_name, o_air_coords = o_air
-                            destination_airport_name, d_air_coords = d_air
-                            road_to_airport = road_km_between_latlng(origin_coords, o_air_coords)
-                            road_from_airport = road_km_between_latlng(d_air_coords, destination_coords)
+                            o_air_name, o_air_coords = o_air   # name already contains code
+                            d_air_name, d_air_coords = d_air
+                            road_to_hub = road_km_between_latlng(origin_coords, o_air_coords)
+                            road_from_hub = road_km_between_latlng(d_air_coords, destination_coords)
                             flight_dist = geodesic(o_air_coords, d_air_coords).kilometers
+                            hub_label = f"{o_air_name} \u2192 {d_air_name}"
                         else:
+                            # no airport dataset → straight GC
                             flight_dist = geodesic(origin_coords, destination_coords).kilometers
                     else:
                         flight_dist = geodesic(origin_coords, destination_coords).kilometers
@@ -479,13 +486,12 @@ def process_file(
                         o_port = nearest_point(ports_tree, port_coords_arr, port_names, origin_coords)
                         d_port = nearest_point(ports_tree, port_coords_arr, port_names, destination_coords)
                         if o_port and d_port:
-                            origin_port_name, o_port_latlng = o_port
-                            destination_port_name, d_port_latlng = d_port
-                            # road legs
-                            road_to_port = road_km_between_latlng(origin_coords, o_port_latlng)
-                            road_from_port = road_km_between_latlng(d_port_latlng, destination_coords)
-                            # sea leg
+                            o_port_name, o_port_latlng = o_port  # name already includes (CODE)
+                            d_port_name, d_port_latlng = d_port
+                            road_to_hub = road_km_between_latlng(origin_coords, o_port_latlng)
+                            road_from_hub = road_km_between_latlng(d_port_latlng, destination_coords)
                             sea_dist = searoute_sea_km_between_ports(o_port_latlng, d_port_latlng)
+                            hub_label = f"{o_port_name} \u2192 {d_port_name}"
                             main_distance = sea_dist
                             source = "Sea (ports from ports.geojson)"
                         else:
@@ -498,15 +504,16 @@ def process_file(
                                 destination_port_override=None
                             )
                             sea_dist = sea_km
-                            origin_port_name = o_id or origin_port_name
-                            destination_port_name = d_id or destination_port_name
-                            if o_pll and d_pll and enable_hub_legs:
-                                road_to_port = road_km_between_latlng(origin_coords, o_pll)
-                                road_from_port = road_km_between_latlng(d_pll, destination_coords)
+                            if o_pll and d_pll:
+                                road_to_hub = road_km_between_latlng(origin_coords, o_pll)
+                                road_from_hub = road_km_between_latlng(d_pll, destination_coords)
+                                o_name = f"{o_id}" if o_id else "Origin port"
+                                d_name = f"{d_id}" if d_id else "Destination port"
+                                hub_label = f"{o_name} \u2192 {d_name}"
                             main_distance = sea_dist
                             source = "Sea (searoute internal ports)"
                     else:
-                        # No GeoJSON port KD-tree → use searoute internal ports as before
+                        # No GeoJSON port KD-tree → use searoute internal ports or just searoute
                         sea_km, o_id, d_id, o_pll, d_pll = searoute_with_ports(
                             origin_coords,
                             destination_coords,
@@ -515,13 +522,12 @@ def process_file(
                             destination_port_override=destination_port_override
                         )
                         sea_dist = sea_km
-                        if o_id:
-                            origin_port_name = o_id
-                        if d_id:
-                            destination_port_name = d_id
                         if enable_hub_legs and o_pll and d_pll:
-                            road_to_port = road_km_between_latlng(origin_coords, o_pll)
-                            road_from_port = road_km_between_latlng(d_pll, destination_coords)
+                            road_to_hub = road_km_between_latlng(origin_coords, o_pll)
+                            road_from_hub = road_km_between_latlng(d_pll, destination_coords)
+                            o_name = f"{o_id}" if o_id else "Origin port"
+                            d_name = f"{d_id}" if d_id else "Destination port"
+                            hub_label = f"{o_name} \u2192 {d_name}"
                         main_distance = sea_dist
                         source = "Sea (searoute)"
                 else:
@@ -536,6 +542,7 @@ def process_file(
                     dist = geodesic(origin_coords, destination_coords).kilometers
                     src = "Geodesic Distance"
                 main_distance, source = dist, (src or "Road Distance")
+                # no hubs for pure road
 
             else:
                 # default: treat like road
@@ -551,28 +558,14 @@ def process_file(
         except Exception as e:
             print(f"Error in group {group}: {e}")
 
-        # Combined road column (for hub modes). NOT added into Distance (km).
-        road_combined = 0
-        for v in [road_to_airport, road_from_airport, road_to_port, road_from_port]:
-            if isinstance(v, (int, float)) and v is not pd.NA:
-                road_combined += v
-        if main_distance is None:
-            road_combined = pd.NA
-
         return group, {
             'Distance (km)': main_distance,
             'Source': source,
-            'Road (km)': road_combined,
-            'RoadToAirport (km)': road_to_airport,
+            'Distance to hub (km)': road_to_hub,
+            'Hub': hub_label,
+            'Distance from hub (km)': road_from_hub,
             'Flight (km)': flight_dist,
-            'RoadFromAirport (km)': road_from_airport,
-            'Origin Airport': origin_airport_name,
-            'Destination Airport': destination_airport_name,
-            'RoadToPort (km)': road_to_port,
-            'Sea (km)': sea_dist,
-            'RoadFromPort (km)': road_from_port,
-            'Origin Port': origin_port_name,
-            'Destination Port': destination_port_name
+            'Sea (km)': sea_dist
         }
 
     # Run with progress bar
@@ -616,7 +609,7 @@ def main():
 
     # Options
     enable_hub_legs = st.checkbox(
-        "Enable nearest airport/port legs (adds road-to/from hub columns; NOT counted in Distance (km))", value=False
+        "Enable nearest airport/port legs (adds unified hub columns; NOT counted in Distance (km))", value=False
     )
 
     use_geojson_ports = False
@@ -626,7 +619,7 @@ def main():
     destination_port_override = None
 
     if enable_hub_legs:
-        st.caption("Road-to/from hubs is shown in 'Road (km)'. 'Distance (km)' remains the main-mode distance only.")
+        st.caption("Hub columns show road legs to/from the selected hub and the hub label with code (e.g., 'Prague (CZPRA)').")
 
         # Option 1: Use ports.geojson
         use_geojson_ports = st.checkbox(
