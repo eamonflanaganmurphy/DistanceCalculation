@@ -229,7 +229,7 @@ def get_distance_matrix(origin, destination, api_key):
                 distance = float(txt.replace(' km', '').replace(',', ''))
             elif ' m' in txt:
                 distance = float(txt.replace(' m', '').replace(',', '')) / 1000.0
-            source = "Road Distance"
+            source = "Google Maps API Shortest Road Distance"
     except Exception:
         pass
 
@@ -353,7 +353,6 @@ def coerce_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
         if pd.api.types.is_object_dtype(out[col]):
             try:
                 pd.to_numeric(out[col])
-                # If convertible to numeric, leave as-is
             except Exception:
                 out[col] = out[col].astype("string")
     return out
@@ -375,8 +374,8 @@ def process_file(
     # Ensure output columns
     needed_cols = [
         'Distance (km)', 'Source',
-        'Distance to hub (km)', 'Hub', 'Distance from hub (km)',  # unified hub columns
-        'Flight (km)', 'Sea (km)'  # keep main-mode leg detail for QA
+        'Distance to hub (km)', 'Origin hub', 'Destination hub', 'Distance from hub (km)',
+        'Flight (km)', 'Sea (km)'
     ]
     for col in needed_cols:
         if col not in df.columns:
@@ -449,7 +448,8 @@ def process_file(
 
         # unified hub outputs
         road_to_hub = pd.NA
-        hub_label = pd.NA
+        origin_hub_label = pd.NA
+        destination_hub_label = pd.NA
         road_from_hub = pd.NA
 
         # QA legs
@@ -459,7 +459,6 @@ def process_file(
         try:
             if mode_lower in ["air", "airplane (air)", "flight"]:
                 if origin_coords and destination_coords:
-                    # Airports + road legs (if enabled), but Distance (km) is FLIGHT ONLY
                     if enable_hub_legs and airport_tree is not None:
                         o_air = nearest_point(airport_tree, airport_coords, airport_names, origin_coords)
                         d_air = nearest_point(airport_tree, airport_coords, airport_names, destination_coords)
@@ -469,15 +468,15 @@ def process_file(
                             road_to_hub = road_km_between_latlng(origin_coords, o_air_coords)
                             road_from_hub = road_km_between_latlng(d_air_coords, destination_coords)
                             flight_dist = geodesic(o_air_coords, d_air_coords).kilometers
-                            hub_label = f"{o_air_name} \u2192 {d_air_name}"
+                            origin_hub_label = o_air_name
+                            destination_hub_label = d_air_name
                         else:
-                            # no airport dataset → straight GC
                             flight_dist = geodesic(origin_coords, destination_coords).kilometers
                     else:
                         flight_dist = geodesic(origin_coords, destination_coords).kilometers
 
                     main_distance = flight_dist
-                    source = "Air (GC between airports or points)"
+                    source = "Great Circle Distance"
 
             elif mode_lower in ["cargo ship (sea)", "sea", "ocean", "vessel (sea)"]:
                 if origin_coords and destination_coords:
@@ -491,9 +490,10 @@ def process_file(
                             road_to_hub = road_km_between_latlng(origin_coords, o_port_latlng)
                             road_from_hub = road_km_between_latlng(d_port_latlng, destination_coords)
                             sea_dist = searoute_sea_km_between_ports(o_port_latlng, d_port_latlng)
-                            hub_label = f"{o_port_name} \u2192 {d_port_name}"
+                            origin_hub_label = o_port_name
+                            destination_hub_label = d_port_name
                             main_distance = sea_dist
-                            source = "Sea (ports from ports.geojson)"
+                            source = "Shortest sea route between two points on Earth."
                         else:
                             # fallback to searoute’s internal port selection
                             sea_km, o_id, d_id, o_pll, d_pll = searoute_with_ports(
@@ -507,11 +507,11 @@ def process_file(
                             if o_pll and d_pll:
                                 road_to_hub = road_km_between_latlng(origin_coords, o_pll)
                                 road_from_hub = road_km_between_latlng(d_pll, destination_coords)
-                                o_name = f"{o_id}" if o_id else "Origin port"
-                                d_name = f"{d_id}" if d_id else "Destination port"
-                                hub_label = f"{o_name} \u2192 {d_name}"
+                            origin_hub_label = f"{o_id}" if o_id else pd.NA
+                            destination_hub_label = f"{d_id}" if d_id else pd.NA
                             main_distance = sea_dist
-                            source = "Sea (searoute internal ports)"
+                            # keep generic wording for internal fallback
+                            source = "Sea (searoute)"
                     else:
                         # No GeoJSON port KD-tree → use searoute internal ports or just searoute
                         sea_km, o_id, d_id, o_pll, d_pll = searoute_with_ports(
@@ -525,9 +525,8 @@ def process_file(
                         if enable_hub_legs and o_pll and d_pll:
                             road_to_hub = road_km_between_latlng(origin_coords, o_pll)
                             road_from_hub = road_km_between_latlng(d_pll, destination_coords)
-                            o_name = f"{o_id}" if o_id else "Origin port"
-                            d_name = f"{d_id}" if d_id else "Destination port"
-                            hub_label = f"{o_name} \u2192 {d_name}"
+                        origin_hub_label = f"{o_id}" if o_id else pd.NA
+                        destination_hub_label = f"{d_id}" if d_id else pd.NA
                         main_distance = sea_dist
                         source = "Sea (searoute)"
                 else:
@@ -541,8 +540,9 @@ def process_file(
                 if dist is None and origin_coords and destination_coords:
                     dist = geodesic(origin_coords, destination_coords).kilometers
                     src = "Geodesic Distance"
-                main_distance, source = dist, (src or "Road Distance")
-                # no hubs for pure road
+                main_distance = dist
+                # replace label if API worked
+                source = src if src != "Google Maps API Shortest Road Distance" else "Google Maps API Shortest Road Distance"
 
             else:
                 # default: treat like road
@@ -550,7 +550,8 @@ def process_file(
                 dest_api = destination_key if ',' in destination_key else to_api_location_param(destination_key)
                 dist, src = get_distance_matrix(origin_api, dest_api, API_KEY)
                 if dist is not None:
-                    main_distance, source = dist, src
+                    main_distance = dist
+                    source = "Google Maps API Shortest Road Distance"
                 elif origin_coords and destination_coords:
                     main_distance = geodesic(origin_coords, destination_coords).kilometers
                     source = "Geodesic Distance"
@@ -562,7 +563,8 @@ def process_file(
             'Distance (km)': main_distance,
             'Source': source,
             'Distance to hub (km)': road_to_hub,
-            'Hub': hub_label,
+            'Origin hub': origin_hub_label,
+            'Destination hub': destination_hub_label,
             'Distance from hub (km)': road_from_hub,
             'Flight (km)': flight_dist,
             'Sea (km)': sea_dist
@@ -609,7 +611,7 @@ def main():
 
     # Options
     enable_hub_legs = st.checkbox(
-        "Enable nearest airport/port legs (adds unified hub columns; NOT counted in Distance (km))", value=False
+        "Enable nearest airport/port legs (adds hub columns; NOT counted in Distance (km))", value=False
     )
 
     use_geojson_ports = False
@@ -619,7 +621,7 @@ def main():
     destination_port_override = None
 
     if enable_hub_legs:
-        st.caption("Hub columns show road legs to/from the selected hub and the hub label with code (e.g., 'Prague (CZPRA)').")
+        st.caption("Hub columns show road legs to/from the selected hub and the hub names with codes (e.g., 'Prague (CZPRA)').")
 
         # Option 1: Use ports.geojson
         use_geojson_ports = st.checkbox(
