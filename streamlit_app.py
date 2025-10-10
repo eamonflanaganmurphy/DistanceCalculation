@@ -209,7 +209,7 @@ def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str
 
         # Try multiple possible keys for the port code
         code_raw = _first_str(
-            props.get("port_id"),
+            props.get("port"),
             props.get("id"),
             props.get("locode"),
             props.get("LOCODE"),
