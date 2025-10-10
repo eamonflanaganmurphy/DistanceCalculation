@@ -593,6 +593,51 @@ def main():
         - Sea distances use **Searoute shortest sea paths** between ports defined in your local `ports.geojson` file.
         - All distances are in **kilometres (km)**.
     """)
+        
+    with st.expander("🧭 Valid 'Mode' entries", expanded=False):
+        st.markdown("""
+        The **`Mode`** column determines how each route is calculated.  
+        Accepted values are case-insensitive.
+    
+        **🚛 Road transport**
+        ```
+        road
+        truck
+        truck (road)
+        trucking
+        courier
+        van
+        car
+        ```
+        → Uses **Google Maps Distance Matrix** (shortest road route).  
+        → Falls back to straight-line (geodesic) distance if API fails.  
+        **Source label:** *Google Maps API Shortest Road Distance*
+    
+        **✈️ Air transport**
+        ```
+        air
+        airplane (air)
+        flight
+        ```
+        → Uses nearest airports and computes **Great Circle distance**.  
+        → Road legs to/from airports added if hub option enabled.  
+        **Source label:** *Great Circle Distance*
+    
+        **🚢 Sea transport**
+        ```
+        sea
+        cargo ship (sea)
+        ocean
+        vessel (sea)
+        ```
+        → Uses nearest seaports from local `ports.geojson`.  
+        → Calculates **shortest sea route** using Searoute.  
+        → Road legs to/from ports added if hub option enabled.  
+        **Source label:** *Shortest sea route between two points on Earth.*
+    
+        **⚙️ Fallback**
+        - If left blank or unrecognised, defaults to *road* mode.
+        """)
     
     # Toggle for hub legs
     enable_hub_legs = st.checkbox(
