@@ -55,7 +55,7 @@ def authenticate_user():
         return True
 
     st.subheader("Access")
-    st.write("Enter the app password or provide a Google Maps API key to continue.")
+    st.write("Enter the app password or provide a Google Maps API key (With Geocoding, and Distance Matrix API enabled) to continue.")
 
     col1, col2 = st.columns(2)
 
