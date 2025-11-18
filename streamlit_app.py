@@ -22,10 +22,8 @@ except Exception:
     PortProps = None
     _HAS_AREAFEATURE = False
 
-# Google Maps API
-DISTANCE_MATRIX_API_ENDPOINT = "https://maps.googleapis.com/maps/api/distancematrix/json"
-GEOCODING_API_ENDPOINT = "https://maps.googleapis.com/maps/api/geocode/json"
-API_KEY = st.secrets.google_api_key
+# Global API key placeholder. Will be set after authentication.
+API_KEY = None
 
 # Caches
 distance_cache: Dict[Tuple[str, str], Tuple[Optional[float], Optional[str]]] = {}
@@ -39,25 +37,53 @@ _COORD_PATTERN_PLAIN = re.compile(
     r'^\s*([+-]?\d+(?:\.\d+)?)\s*[,;]\s*([+-]?\d+(?:\.\d+)?)\s*$'
 )
 
+# Google Maps endpoints
+DISTANCE_MATRIX_API_ENDPOINT = "https://maps.googleapis.com/maps/api/distancematrix/json"
+GEOCODING_API_ENDPOINT = "https://maps.googleapis.com/maps/api/geocode/json"
 
-def check_password():
-    """Simple password gate backed by st.secrets['password']"""
-    def password_entered():
-        if st.session_state["password"] == st.secrets["password"]:
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
 
-    if "password_correct" not in st.session_state:
-        st.text_input("Password", type="password", on_change=password_entered, key="password")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.text_input("Password", type="password", on_change=password_entered, key="password")
-        st.error("Incorrect password")
-        return False
-    else:
+def authenticate_user():
+    """
+    Let user either enter the password from st.secrets or provide their own Google Maps API key.
+    If either is valid we set session_state['authenticated'] = True and store the API key in session_state['api_key'].
+    """
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+        st.session_state["api_key"] = None
+
+    if st.session_state["authenticated"]:
         return True
+
+    st.subheader("Access")
+    st.write("Enter the app password or provide a Google Maps API key to continue.")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # Password input; if correct, assign secret API key from st.secrets if present
+        pw = st.text_input("Password", type="password", key="password_input")
+        if st.button("Use password"):
+            if "password" in st.secrets and pw and pw == st.secrets["password"]:
+                st.session_state["authenticated"] = True
+                # prefer st.secrets.google_api_key if present otherwise keep None
+                st.session_state["api_key"] = st.secrets.get("google_api_key")
+                st.success("Authenticated with password.")
+            else:
+                st.error("Incorrect password. Or password not configured in st.secrets.")
+
+    with col2:
+        # Allow user to supply their own API key
+        user_key = st.text_input("Google Maps API key", key="user_api_key_input")
+        if st.button("Use this API key"):
+            trimmed = (user_key or "").strip()
+            if trimmed:
+                st.session_state["authenticated"] = True
+                st.session_state["api_key"] = trimmed
+                st.success("Authenticated with provided API key.")
+            else:
+                st.error("Please enter a valid API key.")
+
+    return st.session_state["authenticated"]
 
 
 def try_parse_coordinates(s) -> Optional[Tuple[float, float]]:
@@ -109,8 +135,17 @@ def coords_for_location(s, api_key) -> Optional[Tuple[float, float]]:
         coordinate_cache[key] = parsed
         return parsed
 
+    # If no api key, we cannot geocode using Google
+    if not api_key:
+        coordinate_cache[key] = None
+        return None
+
     params = {'address': str(s).strip(), 'key': api_key}
-    data = requests.get(GEOCODING_API_ENDPOINT, params=params).json()
+    try:
+        data = requests.get(GEOCODING_API_ENDPOINT, params=params, timeout=30).json()
+    except Exception:
+        coordinate_cache[key] = None
+        return None
 
     coords = None
     if data.get('status') == 'OK' and data.get('results'):
@@ -123,11 +158,6 @@ def coords_for_location(s, api_key) -> Optional[Tuple[float, float]]:
 
 # ---------- Airports (with codes in display name) ----------
 def load_international_airports(filename="airports.csv") -> List[Tuple[str, Tuple[float, float]]]:
-    """
-    Read airports (expects columns such as: name, latitude_deg, longitude_deg, type, iata_code or ident/gps_code).
-    Uses only large/medium airports.
-    Returns list of (display_name_with_code, (lat, lng)).
-    """
     airports: List[Tuple[str, Tuple[float, float]]] = []
     try:
         with open(filename, mode="r", encoding="utf-8") as f:
@@ -153,12 +183,11 @@ def load_international_airports(filename="airports.csv") -> List[Tuple[str, Tupl
 
 
 def build_kdtree(points: List[Tuple[str, Tuple[float, float]]]):
-    """KD-tree over (lat, lng). Returns (tree, names, coords_array) or (None, [], None) if empty."""
     if not points:
         return None, [], None
     coords = np.array([[p[1][0], p[1][1]] for p in points], dtype=float)
     tree = cKDTree(coords)
-    names = [p[0] for p in points]  # already includes codes in display
+    names = [p[0] for p in points]
     return tree, names, coords
 
 
@@ -166,18 +195,13 @@ def nearest_point(tree, coords_array, names, target: Tuple[float, float]) -> Opt
     if tree is None or coords_array is None or not names:
         return None
     _, idx = tree.query([target[0], target[1]], k=1)
-    name = names[idx]
-    lat, lng = coords_array[idx]
+    name = names[int(idx)]
+    lat, lng = coords_array[int(idx)]
     return (name, (float(lat), float(lng)))
 
 
 # ---------- Ports from local GeoJSON (with codes in display name) ----------
 def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str, Tuple[float, float]]]:
-    """
-    Load ports from a local GeoJSON file at 'ports.geojson'.
-    Returns list of (display_name_with_code, (lat, lng)) like 'Piombino (TPIO)'.
-    Tries several property keys to find a port code.
-    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Local ports file '{path}' not found.")
     with open(path, "r", encoding="utf-8") as f:
@@ -190,7 +214,6 @@ def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str
         for v in vals:
             if isinstance(v, str) and v.strip():
                 return v.strip()
-            # some datasets put a single code in a 1-item list
             if isinstance(v, (list, tuple)) and v and isinstance(v[0], str) and v[0].strip():
                 return v[0].strip()
         return None
@@ -200,26 +223,24 @@ def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str
         props = feat.get("properties", {}) or {}
         if geom.get("type") != "Point":
             continue
-        coords = geom.get("coordinates")  # [lon, lat]
+        coords = geom.get("coordinates")
         if not (isinstance(coords, (list, tuple)) and len(coords) == 2):
             continue
 
         lon, lat = coords
         name_raw = _first_str(props.get("name"), props.get("port_name"), props.get("Name"), "Port") or "Port"
 
-        # Try multiple possible keys for the port code
         code_raw = _first_str(
             props.get("port"),
             props.get("id"),
             props.get("locode"),
             props.get("LOCODE"),
             props.get("code"),
-            props.get("unlocs"),        # sometimes used in other datasets
+            props.get("unlocs"),
         )
 
         code = code_raw.upper().replace(" ", "") if code_raw else ""
 
-        # Always append code if present and not already present at the end
         if code and not name_raw.rstrip().endswith(f"({code})"):
             display = f"{name_raw} ({code})"
         else:
@@ -234,19 +255,26 @@ def load_ports_from_geojson_local(path: str = "ports.geojson") -> List[Tuple[str
 
 # ---------- Distance helpers ----------
 def get_distance_matrix(origin, destination, api_key):
-    """Road distance via Google Distance Matrix. Accepts address strings or 'lat,lng' strings."""
     origin_key = normalise_location_key(origin)
     dest_key = normalise_location_key(destination)
     key = (origin_key, dest_key)
     if key in distance_cache:
         return distance_cache[key]
 
+    if not api_key:
+        distance_cache[key] = (None, None)
+        return None, None
+
     params = {
         'origins': to_api_location_param(origin),
         'destinations': to_api_location_param(destination),
         'key': api_key
     }
-    data = requests.get(DISTANCE_MATRIX_API_ENDPOINT, params=params).json()
+    try:
+        data = requests.get(DISTANCE_MATRIX_API_ENDPOINT, params=params, timeout=30).json()
+    except Exception:
+        distance_cache[key] = (None, None)
+        return None, None
 
     distance, source = None, None
     try:
@@ -266,7 +294,6 @@ def get_distance_matrix(origin, destination, api_key):
 
 
 def road_km_between_latlng(a_latlng: Tuple[float, float], b_latlng: Tuple[float, float]) -> Optional[float]:
-    """Road km between two (lat,lng) pairs using Distance Matrix; fallback to geodesic if needed."""
     if not a_latlng or not b_latlng:
         return None
     a = f"{a_latlng[0]},{a_latlng[1]}"
@@ -282,10 +309,6 @@ def road_km_between_latlng(a_latlng: Tuple[float, float], b_latlng: Tuple[float,
 
 # ---------- Searoute wrappers ----------
 def searoute_sea_km_between_ports(o_port_latlng: Tuple[float, float], d_port_latlng: Tuple[float, float]) -> float:
-    """
-    Use searoute between two known port coordinates.
-    Returns sea distance in km (falls back to GC if length not present).
-    """
     o_lonlat = [o_port_latlng[1], o_port_latlng[0]]
     d_lonlat = [d_port_latlng[1], d_port_latlng[0]]
     route = sr.searoute(o_lonlat, d_lonlat, units="naut")
@@ -301,10 +324,6 @@ def searoute_sea_km_between_ports(o_port_latlng: Tuple[float, float], d_port_lat
 
 # ---------- Arrow-safe preview ----------
 def coerce_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make object-typed text columns Arrow-friendly by converting to Pandas 'string' dtype
-    for UI display only (does not mutate the working df).
-    """
     out = df.copy()
     for col in out.columns:
         if pd.api.types.is_object_dtype(out[col]):
@@ -321,9 +340,14 @@ def process_file(
     enable_hub_legs: bool,
 ) -> pd.DataFrame:
 
-    df = pd.read_excel(input_file)
+    # Accept either BytesIO or uploaded file object
+    if hasattr(input_file, "read"):
+        input_bytes = BytesIO(input_file.read())
+        df = pd.read_excel(input_bytes)
+    else:
+        # If the caller already passed BytesIO
+        df = pd.read_excel(input_file)
 
-    # Decide output columns based on the hub toggle
     base_cols = ['Distance (km)', 'Source', 'Flight (km)', 'Sea (km)']
     hub_cols = [
         'Distance to hub (km)', 'Origin hub', 'Destination hub',
@@ -334,7 +358,6 @@ def process_file(
         if col not in df.columns:
             df[col] = pd.NA
 
-    # If hub legs are disabled, also drop any lingering hub columns from prior runs
     if not enable_hub_legs:
         for col in hub_cols:
             if col in df.columns:
@@ -370,7 +393,7 @@ def process_file(
     airports = load_international_airports("airports.csv")
     airport_tree, airport_names, airport_coords = build_kdtree(airports)
 
-    # Ports KD-tree from local GeoJSON (for sea hubs) — strictly enforced when hub legs ON
+    # Ports KD-tree from local GeoJSON (for sea hubs)
     ports_tree = None
     port_names: List[str] = []
     port_coords_arr = None
@@ -380,9 +403,8 @@ def process_file(
             ports_tree, port_names, port_coords_arr = build_kdtree(ports_list)
         except Exception as e:
             st.error(f"Required local 'ports.geojson' not available/valid: {e}")
-            st.stop()  # Enforce: no processing without the local file when hub legs are enabled
+            st.stop()
 
-    # Grouping
     tmp = rows_to_process.copy()
     tmp['group_key'] = tmp.apply(
         lambda x: (
@@ -395,24 +417,20 @@ def process_file(
     unique_groups = tmp['group_key'].unique()
     results_cache = {}
 
-    # Core per-group computation
     def process_group(group):
         origin_key, destination_key, mode_lower = group
         origin_coords = coordinate_cache.get(origin_key) or coords_for_location(origin_key, API_KEY)
         destination_coords = coordinate_cache.get(destination_key) or coords_for_location(destination_key, API_KEY)
 
-        # Outputs (initialise)
-        main_distance = None    # Distance (km): main-mode only
+        main_distance = None
         source = None
 
-        # hub outputs (only populated if enable_hub_legs)
         road_to_hub = pd.NA
         origin_hub_label = pd.NA
         destination_hub_label = pd.NA
         road_from_hub = pd.NA
-        road_sum_hub = pd.NA  # combined
+        road_sum_hub = pd.NA
 
-        # QA legs
         flight_dist = pd.NA
         sea_dist = pd.NA
 
@@ -423,7 +441,7 @@ def process_file(
                         o_air = nearest_point(airport_tree, airport_coords, airport_names, origin_coords)
                         d_air = nearest_point(airport_tree, airport_coords, airport_names, destination_coords)
                         if o_air and d_air:
-                            o_air_name, o_air_coords = o_air   # name already contains code
+                            o_air_name, o_air_coords = o_air
                             d_air_name, d_air_coords = d_air
                             road_to_hub = road_km_between_latlng(origin_coords, o_air_coords)
                             road_from_hub = road_km_between_latlng(d_air_coords, destination_coords)
@@ -441,11 +459,10 @@ def process_file(
             elif mode_lower in ["cargo ship (sea)", "sea", "ocean", "vessel (sea)"]:
                 if origin_coords and destination_coords:
                     if enable_hub_legs:
-                        # Enforced: ports_tree must exist (we stopped earlier if not)
                         o_port = nearest_point(ports_tree, port_coords_arr, port_names, origin_coords)
                         d_port = nearest_point(ports_tree, port_coords_arr, port_names, destination_coords)
                         if o_port and d_port:
-                            o_port_name, o_port_latlng = o_port  # name already includes (CODE)
+                            o_port_name, o_port_latlng = o_port
                             d_port_name, d_port_latlng = d_port
                             road_to_hub = road_km_between_latlng(origin_coords, o_port_latlng)
                             road_from_hub = road_km_between_latlng(d_port_latlng, destination_coords)
@@ -455,12 +472,10 @@ def process_file(
                             main_distance = sea_dist
                             source = "Shortest sea route between two points on Earth."
                         else:
-                            # If we can't find two ports, still compute main sea distance without hubs
                             sea_dist = geodesic(origin_coords, destination_coords).kilometers
                             main_distance = sea_dist
                             source = "Shortest sea route between two points on Earth."
                     else:
-                        # Hub legs disabled → just compute sea main distance with searoute between points
                         route = sr.searoute([origin_coords[1], origin_coords[0]], [destination_coords[1], destination_coords[0]], units="naut")
                         if route and getattr(route, "properties", None) and "length" in route.properties:
                             sea_dist = float(route.properties["length"]) * 1.852
@@ -483,7 +498,6 @@ def process_file(
                 source = "Google Maps API Shortest Road Distance" if src == "Google Maps API Shortest Road Distance" else src
 
             else:
-                # default: treat like road
                 origin_api = origin_key if ',' in origin_key else to_api_location_param(origin_key)
                 dest_api = destination_key if ',' in destination_key else to_api_location_param(destination_key)
                 dist, src = get_distance_matrix(origin_api, dest_api, API_KEY)
@@ -494,7 +508,6 @@ def process_file(
                     main_distance = geodesic(origin_coords, destination_coords).kilometers
                     source = "Geodesic Distance"
 
-            # Sum the two road legs into the combined column (only when hubs enabled and at least one leg present)
             if enable_hub_legs:
                 to_val = float(road_to_hub) if isinstance(road_to_hub, (int, float)) and road_to_hub is not pd.NA else None
                 from_val = float(road_from_hub) if isinstance(road_from_hub, (int, float)) and road_from_hub is not pd.NA else None
@@ -504,7 +517,6 @@ def process_file(
         except Exception as e:
             print(f"Error in group {group}: {e}")
 
-        # Build row dict conditioned on hub toggle
         row_out = {
             'Distance (km)': main_distance,
             'Source': source,
@@ -521,7 +533,6 @@ def process_file(
             })
         return group, row_out
 
-    # Run with progress bar
     st.write("Calculating distances…")
     progress_bar = st.progress(0)
     results_cache.clear()
@@ -535,7 +546,6 @@ def process_file(
             done += 1
             progress_bar.progress(done / max(total, 1))
 
-    # Write results back using original row indices
     for idx, row in rows_to_process.iterrows():
         gk = (
             normalise_location_key(row.get('From')),
@@ -546,7 +556,6 @@ def process_file(
         for k, v in res.items():
             df.at[idx, k] = v
 
-    # Clean helper col if present
     if 'group_key' in df.columns:
         df.drop(columns=['group_key'], inplace=True, errors='ignore')
 
@@ -554,129 +563,81 @@ def process_file(
 
 
 def main():
+    global API_KEY
     st.title("🌍 Distance Calculation Tool")
     st.caption("Automatically calculates road, air, and sea transport distances between locations for GHG emissions inventory calculations.")
 
-    if not check_password():
+    # Authentication
+    if not authenticate_user():
         return
-        
+
+    API_KEY = st.session_state.get("api_key")
+
     with st.expander("📘 How to use this tool", expanded=False):
         st.markdown("""
-        **1️⃣ Upload your file**
-    
-        - Upload an Excel file containing at least three columns:  
-          `From` (origin), `To` (destination), and `Mode` (e.g. *Road*, *Air*, *Sea*).  
-        - Each row represents one transport route.
-    
-        **2️⃣ Choose options**
-    
-        - Optionally enable *“nearest airport/port legs”* to include the road distance
-          to and from the nearest hubs.  
-        - When enabled, additional columns will appear for:
-          - `Origin hub`, `Destination hub`
-          - `Distance to hub (km)`, `Distance from hub (km)`
-          - `Distance to/from hub (km)` (sum of both)
-    
-        **3️⃣ Run the calculations**
-    
-        - Click “Process file” (this happens automatically after upload).  
-        - Watch the progress bars for geocoding and distance computation.
-    
-        **4️⃣ Review and download**
-    
-        - A preview of your processed data will appear below.  
-        - Use the **Download Processed File** button to export an `.xlsx` file.
-    
-        **🗺️ Notes**
-        - Road distances use **Google Maps API** (shortest route).
-        - Air distances use **Great Circle** calculations between airports.
-        - Sea distances use **Searoute shortest sea paths** between ports.
-        - All distances are in **kilometres (km)**.
-        - You may still want to modify these distances - e.g., trucking may not always take the shortest route so you may want to increase distances by 10% to compensate for this.
-    """)
-        
-    with st.expander("🧭 Valid 'Mode' entries", expanded=False):
-        st.markdown("""
-        The **`Mode`** column determines how each route is calculated.  
-        Accepted values are case-insensitive.
-    
-        **🚛 Road transport**
-        ```
-        road
-        truck
-        truck (road)
-        trucking
-        courier
-        van
-        car
-        ```
-        → Uses **Google Maps Distance Matrix** (shortest road route).  
-        → Falls back to straight-line (geodesic) distance if API fails.  
-        **Source label:** *Google Maps API Shortest Road Distance*
-    
-        **✈️ Air transport**
-        ```
-        air
-        airplane (air)
-        flight
-        ```
-        → Uses nearest airports and computes **Great Circle distance**.  
-        → Road legs to/from airports added if hub option enabled.  
-        **Source label:** *Great Circle Distance*
-    
-        **🚢 Sea transport**
-        ```
-        sea
-        cargo ship (sea)
-        ocean
-        vessel (sea)
-        ```
-        → Uses nearest seaports from local `ports.geojson`.  
-        → Calculates **shortest sea route** using Searoute.  
-        → Road legs to/from ports added if hub option enabled.  
-        **Source label:** *Shortest sea route between two points on Earth.*
-    
-        **⚙️ Fallback**
-        - If left blank or unrecognised, defaults to *road* mode.
+        1) Upload an Excel file with columns: From, To, Mode
+        2) Optionally enable nearest airport/port legs
+        3) Click Calculate to run the distance computations
+        4) Download the processed Excel file
         """)
-    
-    # Toggle for hub legs
+
+    # Options area
     enable_hub_legs = st.checkbox(
-        "Enable nearest airport/port legs (adds road distances to closest airport/seaport in seperate columns)", value=False
+        "Enable nearest airport/port legs (adds road distances to closest airport/seaport in separate columns)", value=False
     )
 
     uploaded_file = st.file_uploader("Upload an Excel file", type=["xlsx"])
+
     if uploaded_file:
-        input_file = BytesIO(uploaded_file.read())
-        df = pd.read_excel(input_file)
+        # Show preview but do not run calculations automatically
+        try:
+            preview_bytes = BytesIO(uploaded_file.read())
+            preview_bytes.seek(0)
+            sample_df = pd.read_excel(preview_bytes)
+            st.write("Input data preview:")
+            st.dataframe(coerce_arrow_safe(sample_df.head()))
+            # Reset file pointer by rewrapping the uploaded file content
+            uploaded_file = BytesIO(preview_bytes.getvalue())
+        except Exception as e:
+            st.error(f"Could not read uploaded file: {e}")
+            return
 
-        # UI-safe preview
-        st.write("Input data preview:")
-        st.dataframe(coerce_arrow_safe(df.head()))
+        st.info("File uploaded. Click Calculate to run distance computations.")
+        if st.button("Calculate"):
+            # Clear caches between runs for consistent results
+            distance_cache.clear()
+            coordinate_cache.clear()
 
-        st.write("Processing file…")
-        processed_df = process_file(
-            input_file,
-            enable_hub_legs=enable_hub_legs
-        )
+            # Run processing
+            with st.spinner("Running calculations..."):
+                try:
+                    processed_df = process_file(
+                        uploaded_file,
+                        enable_hub_legs=enable_hub_legs
+                    )
+                except Exception as e:
+                    st.error(f"Processing failed: {e}")
+                    return
 
-        if enable_hub_legs:
-            st.caption("Ports are selected from local 'ports.geojson' (codes included in hub names). No fallback is used.")
+            st.write("Processed data preview:")
+            st.dataframe(coerce_arrow_safe(processed_df.head()))
 
-        st.write("Processed data preview:")
-        st.dataframe(coerce_arrow_safe(processed_df.head()))
+            # Download
+            output_file = BytesIO()
+            processed_df.to_excel(output_file, index=False)
+            output_file.seek(0)
+            st.download_button(
+                label="Download processed file",
+                data=output_file,
+                file_name="processed_file.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
-        # Download
-        output_file = BytesIO()
-        processed_df.to_excel(output_file, index=False)
-        output_file.seek(0)
-        st.download_button(
-            label="Download processed file",
-            data=output_file,
-            file_name="processed_file.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            if enable_hub_legs:
+                st.caption("Ports are selected from local 'ports.geojson' (codes included in hub names). No fallback is used when hubs enabled.")
 
+    else:
+        st.write("No file uploaded yet.")
 
 if __name__ == "__main__":
     main()
