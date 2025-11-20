@@ -334,10 +334,77 @@ def coerce_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# ---------- Column detection / selection ----------
+def detect_or_select_columns(df: pd.DataFrame) -> Tuple[str, str, str]:
+    """
+    Try to automatically detect From / To / Mode columns.
+    If any cannot be found, show UI controls for the user to manually select them.
+    Returns a tuple: (from_col, to_col, mode_col)
+    """
+    cols = list(df.columns)
+    lower_map = {c.strip().lower(): c for c in cols}
+
+    auto_from = None
+    auto_to = None
+    auto_mode = None
+
+    # Heuristics for From
+    for key in ["from", "origin", "start", "pickup"]:
+        if key in lower_map:
+            auto_from = lower_map[key]
+            break
+
+    # Heuristics for To
+    for key in ["to", "destination", "end", "dropoff"]:
+        if key in lower_map:
+            auto_to = lower_map[key]
+            break
+
+    # Heuristics for Mode
+    for key in ["mode", "transport mode", "transport", "type"]:
+        if key in lower_map:
+            auto_mode = lower_map[key]
+            break
+
+    missing = []
+    if not auto_from:
+        missing.append("From")
+    if not auto_to:
+        missing.append("To")
+    if not auto_mode:
+        missing.append("Mode")
+
+    if not missing:
+        return auto_from, auto_to, auto_mode
+
+    st.warning(f"Could not auto-detect required column(s): {', '.join(missing)}. Please select them manually below.")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        default_idx = cols.index(auto_from) if auto_from and auto_from in cols else 0
+        from_col = st.selectbox("Select the 'From' column", cols, index=default_idx)
+
+    with col2:
+        default_idx = cols.index(auto_to) if auto_to and auto_to in cols else 0
+        to_col = st.selectbox("Select the 'To' column", cols, index=default_idx)
+
+    with col3:
+        default_idx = cols.index(auto_mode) if auto_mode and auto_mode in cols else 0
+        mode_col = st.selectbox("Select the 'Mode' column", cols, index=default_idx)
+
+    st.success(f"Using columns: From={from_col}, To={to_col}, Mode={mode_col}")
+
+    return from_col, to_col, mode_col
+
+
 # ---------- Main processing ----------
 def process_file(
     input_file,
     enable_hub_legs: bool,
+    from_col: str,
+    to_col: str,
+    mode_col: str,
 ) -> pd.DataFrame:
 
     # Accept either BytesIO or uploaded file object
@@ -363,6 +430,13 @@ def process_file(
             if col in df.columns:
                 df.drop(columns=[col], inplace=True)
 
+    # If the user selected different column names, ensure they exist
+    # If not present, create them as empty to avoid KeyErrors later and surface a warning
+    for c in [from_col, to_col, mode_col]:
+        if c not in df.columns:
+            df[c] = pd.NA
+            st.warning(f"Selected column '{c}' was not present in uploaded file. It has been created as empty.")
+
     rows_to_process = df[df['Distance (km)'].isna()]
     if rows_to_process.empty:
         st.info("No new rows to process.")
@@ -371,8 +445,8 @@ def process_file(
     # Geocode warm-up
     unique_addresses = set()
     for _, r in rows_to_process.iterrows():
-        unique_addresses.add(str(r['From']).strip())
-        unique_addresses.add(str(r['To']).strip())
+        unique_addresses.add(str(r.get(from_col)).strip())
+        unique_addresses.add(str(r.get(to_col)).strip())
 
     st.write("Geocoding unique locations…")
     warmup_bar = st.progress(0)
@@ -408,9 +482,9 @@ def process_file(
     tmp = rows_to_process.copy()
     tmp['group_key'] = tmp.apply(
         lambda x: (
-            normalise_location_key(x.get('From')),
-            normalise_location_key(x.get('To')),
-            str(x.get('Mode', '')).strip().lower()
+            normalise_location_key(x.get(from_col)),
+            normalise_location_key(x.get(to_col)),
+            str(x.get(mode_col, '')).strip().lower()
         ),
         axis=1
     )
@@ -548,9 +622,9 @@ def process_file(
 
     for idx, row in rows_to_process.iterrows():
         gk = (
-            normalise_location_key(row.get('From')),
-            normalise_location_key(row.get('To')),
-            str(row.get('Mode', '')).strip().lower()
+            normalise_location_key(row.get(from_col)),
+            normalise_location_key(row.get(to_col)),
+            str(row.get(mode_col, '')).strip().lower()
         )
         res = results_cache.get(gk, {})
         for k, v in res.items():
@@ -575,7 +649,7 @@ def main():
 
     with st.expander("📘 How to use this tool", expanded=False):
         st.markdown("""
-        1) Upload an Excel file with columns: From, To, Mode
+        1) Upload an Excel file with columns: From, To, Mode (or map them using the UI if your column names differ)
         2) Optionally enable nearest airport/port legs
         3) Click Calculate to run the distance computations
         4) Download the processed Excel file
@@ -602,6 +676,14 @@ def main():
             st.error(f"Could not read uploaded file: {e}")
             return
 
+        # Detect or ask user for columns
+        from_col, to_col, mode_col = detect_or_select_columns(sample_df)
+
+        # Store these for the run
+        st.session_state["from_col"] = from_col
+        st.session_state["to_col"] = to_col
+        st.session_state["mode_col"] = mode_col
+
         st.info("File uploaded. Click Calculate to run distance computations.")
         if st.button("Calculate"):
             # Clear caches between runs for consistent results
@@ -613,7 +695,10 @@ def main():
                 try:
                     processed_df = process_file(
                         uploaded_file,
-                        enable_hub_legs=enable_hub_legs
+                        enable_hub_legs=enable_hub_legs,
+                        from_col=from_col,
+                        to_col=to_col,
+                        mode_col=mode_col
                     )
                 except Exception as e:
                     st.error(f"Processing failed: {e}")
@@ -638,6 +723,7 @@ def main():
 
     else:
         st.write("No file uploaded yet.")
+
 
 if __name__ == "__main__":
     main()
